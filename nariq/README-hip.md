@@ -6,9 +6,10 @@ build; build from source.
 
 The HIP path shares the orchestration of `ggml/src/ggml-cuda/trellis.cu`. Decode (batch 1) uses a scalar GEMV
 (one thread per output row, integer dot products on the INT8 grid); prefill and batched runs on RDNA4 use a
-gfx12 WMMA (matrix-core) kernel that decodes each 16x16 weight tile into LDS and accumulates in fp32. The scalar
-path remains the correctness oracle and the fallback for odd shapes / small batches; force it with
-`GGML_TRELLIS_HIP_MM=0`. Expect decode well below the CUDA numbers; prefill is ~3.3x the scalar tier.
+gfx12 WMMA (matrix-core) kernel (`128x128` 2D wave-tiled for `batch >= 32, N >= 128`) that decodes each 16x16
+weight tile into LDS and accumulates in fp32, paired with wave-shuffle fused blockwise Hadamard and MLP chain
+kernels. The scalar path remains the correctness oracle and the fallback for odd shapes / small batches; force
+it with `GGML_TRELLIS_HIP_MM=0`. Expect decode below the CUDA numbers; prefill is ~10x the scalar tier.
 
 ## Build
 
@@ -89,17 +90,17 @@ Ryzen 7 9700X.
 
 | Test | Result |
 | --- | ---: |
-| `pp512` | 225 tokens/s |
-| `tg32` | 16.1 tokens/s |
-| `pp512 @ d4096` / `tg32 @ d4096` | 222 / 16.0 tokens/s |
+| `pp512` | 700.6 tokens/s |
+| `tg32` | 19.9 tokens/s |
+| `pp512 @ d4096` / `tg32 @ d4096` | 680.8 / 19.7 tokens/s |
 | `pp512` with `GGML_TRELLIS_HIP_MM=0` (scalar) | 67.5 tokens/s |
 | Full GPU offload ceiling | ~83K tokens (14.3 GiB peak at 64K) |
-| Greedy CPU vs HIP, 24 tokens | byte-identical |
+| Full-vocab FP32 logit parity vs scalar (`ubatch=32`, 60 rows) | `mean_kl = 7.41e-07`, `top1 = 100%`, greedy identical |
 
-Decode sits at the low end of the 15-30 tokens/s target and is still scalar; prefill uses the matrix cores (~3.3x
-the scalar tier) but is below the CUDA numbers — the remaining wall is the multiply-bound weight decode. Fine for
-agent sessions, not yet for batched serving. Above the full-offload ceiling the context fit drops GPU layers
-silently rather than failing; read the `offloaded N/65` log line when benchmarking.
+Decode sits in the 15-30 tokens/s target range and is still scalar; prefill uses the matrix cores (~10x the
+scalar tier, ~3.1x the initial 64x32 WMMA port) while keeping full fp32-level accuracy via hi/lo f16 activation
+splitting. Fine for agent sessions and interactive use. Above the full-offload ceiling the context fit drops GPU
+layers silently rather than failing; read the `offloaded N/65` log line when benchmarking.
 
 Note for porters: the gfx12 WMMA accumulator feedback rounds with a small bias when chained across many k-blocks,
 so the prefill kernel groups a few k-tiles and flushes each group into an fp32 register accumulator. Also,
