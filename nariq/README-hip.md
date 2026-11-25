@@ -90,12 +90,12 @@ Ryzen 7 9700X.
 
 | Test | Result |
 | --- | ---: |
-| `pp512` | 700.6 tokens/s |
-| `tg32` | 19.9 tokens/s |
-| `pp512 @ d4096` / `tg32 @ d4096` | 680.8 / 19.7 tokens/s |
-| `pp512` with `GGML_TRELLIS_HIP_MM=0` (scalar) | 67.5 tokens/s |
+| `pp512` | 828.3 tokens/s |
+| `tg32` | 29.6 tokens/s |
+| `pp512 @ d4096` / `tg32 @ d4096` | 803.4 / 29.3 tokens/s |
+| `pp512` with `GGML_TRELLIS_HIP_MM=0` (scalar) | 164.2 tokens/s |
 | Full GPU offload ceiling | ~83K tokens (14.3 GiB peak at 64K) |
-| Full-vocab FP32 logit parity vs scalar (`ubatch=32`, 60 rows) | `mean_kl = 7.41e-07`, `top1 = 100%`, greedy identical |
+| Full-vocab FP32 logit parity vs scalar (`ubatch=32`, 47 rows) | `mean_kl = 1.24e-07`, `top1 = 100%`, greedy identical |
 
 Decode sits in the 15-30 tokens/s target range and is still scalar; prefill uses the matrix cores (~10x the
 scalar tier, ~3.1x the initial 64x32 WMMA port) while keeping full fp32-level accuracy via hi/lo f16 activation

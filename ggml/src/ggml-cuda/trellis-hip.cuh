@@ -80,12 +80,9 @@ static __device__ __forceinline__ uint32_t state_at(const uint32_t * tile, int w
 // This must be an UNSIGNED byte sum. ggml_cuda_dp4a() is the signed form and would read digits
 // >= 32 as negative (libtrellis uses the unsigned __dp4a overload for the same reason).
 static __device__ __forceinline__ int grid_int(uint32_t st) {
-    // st is 16-bit, so splitting 0x83DCD12D lets both halves use full-rate 24-bit multiply
-    const uint32_t lo = __umul24(st, 0xD12Du);
-    const uint32_t hi = __umul24(st, 0x83DCu);
-    const uint32_t x = lo + (hi << 16);
+    const uint32_t x = st * 0x83DCD12Du;
     const uint32_t digits = (x >> 2) & 0x3F3F3F3Fu;
-    return (int) __builtin_amdgcn_sad_u8(digits, 0u, 0u) - 126;
+    return (int) __builtin_amdgcn_sad_u8(digits, 0u, (uint32_t) -126);
 }
 
 static __device__ __forceinline__ float grid_value(uint32_t st) {
@@ -100,306 +97,634 @@ static __device__ __forceinline__ int ring_pos(int r, int c) {
 
 // ---- side transforms -----------------------------------------------------------------------------------
 
-struct side_args {
-    int n;        // entries per row (K or N)
-    int len;      // block size (kind 1) or slice length (kind 2)
-    int run;      // len / m
-    int m;        // Paley factor: 1, 12, 20, 68
-    int h;        // butterfly stage
-    int shards;   // kind 1: n/block; kind 2: the descriptor's shards
-    int nparts;   // kind 2 fused parts, else 0
-    int inverse;
-    int parts[GGML_TRELLIS_MAX_PARTS];
-    float scale;
+struct paley_table {
+    int8_t h[68 * 68];
 };
 
-// the stored index of slice `shard`'s local entry l (fused parts are stored part by part)
-static __device__ __forceinline__ int64_t stored(const side_args & a, int l, int shard) {
-    if (a.nparts == 0) {
-        return (int64_t) shard * a.len + l;
-    }
-    int64_t start = 0;
-    for (int p = 0; p < a.nparts; ++p) {
-        const int size = a.parts[p] / a.shards;
-        if (l < size) {
-            return start + (int64_t) shard * size + l;
-        }
-        l -= size;
-        start += a.parts[p];
-    }
-    return start;
-}
-
-// quadratic character mod q (q = m-1 is prime for m in 12, 20, 68)
-static __device__ __forceinline__ int chi(int d, int q) {
+static constexpr int paley_chi(int d, int q) {
     d = (d % q + q) % q;
     if (d == 0) {
         return 0;
     }
     for (int i = 1; i < q; ++i) {
-        if (i * i % q == d) {
+        if ((i * i) % q == d) {
             return 1;
         }
     }
     return -1;
 }
 
-// Wave-shuffle + register Hadamard for 128 elements (32 lanes x 4 elements: k = lane + 32*e).
-static __device__ __forceinline__ void hadamard_128_warp(float (&v)[4], int lane) {
-#pragma unroll
-    for (int h = 1; h < 32; h <<= 1) {
-        const bool hi = (lane & h) != 0;
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const float o = ggml_cuda_shfl_xor(v[e], h);
-            v[e] = hi ? (o - v[e]) : (v[e] + o);
+static constexpr paley_table make_paley(int m) {
+    paley_table p{};
+    const int q = m - 1;
+    for (int i = 0; i < m; ++i) {
+        for (int j = 0; j < m; ++j) {
+            const int s = i == 0 ? (j > 0 ? 1 : 0) : (j == 0 ? -1 : paley_chi(j - i, q));
+            p.h[i * m + j] = (int8_t) (s + (i == j ? 1 : 0));
         }
     }
-    {
-        const float a0 = v[0], b0 = v[1], a1 = v[2], b1 = v[3];
-        v[0] = a0 + b0; v[1] = a0 - b0;
-        v[2] = a1 + b1; v[3] = a1 - b1;
+    return p;
+}
+
+__constant__ paley_table k_h12 = make_paley(12);
+__constant__ paley_table k_h20 = make_paley(20);
+__constant__ paley_table k_h68 = make_paley(68);
+
+static __device__ __forceinline__ int paley_entry(int m, int r, int c) {
+    return m == 12 ? k_h12.h[r * 12 + c] : (m == 20 ? k_h20.h[r * 20 + c] : k_h68.h[r * 68 + c]);
+}
+
+struct hf_parts {
+    int n;
+    int start[GGML_TRELLIS_MAX_PARTS];
+    int shard[GGML_TRELLIS_MAX_PARTS];
+    int cum[GGML_TRELLIS_MAX_PARTS + 1];
+};
+
+static inline hf_parts make_hf_parts(int n, int shards, const int32_t * parts, int nparts) {
+    hf_parts p = {};
+    p.n = (parts != nullptr && nparts > 0) ? nparts : 1;
+    int start = 0, cum = 0;
+    for (int i = 0; i < p.n; ++i) {
+        const int sz = (parts != nullptr && nparts > 0) ? parts[i] : n;
+        p.start[i] = start;
+        p.shard[i] = sz / shards;
+        p.cum[i]   = cum;
+        start += sz;
+        cum   += sz / shards;
     }
-    {
-        const float a0 = v[0], b0 = v[2], a1 = v[1], b1 = v[3];
-        v[0] = a0 + b0; v[2] = a0 - b0;
-        v[1] = a1 + b1; v[3] = a1 - b1;
+    p.cum[p.n] = cum;
+    return p;
+}
+
+static __device__ __forceinline__ int64_t stored_part(const hf_parts & p, int shard, int l) {
+    int start = p.start[0], sh = p.shard[0], cum = p.cum[0];
+#pragma unroll
+    for (int i = 1; i < GGML_TRELLIS_MAX_PARTS; ++i) {
+        if (i < p.n && l >= p.cum[i]) {
+            start = p.start[i];
+            sh    = p.shard[i];
+            cum   = p.cum[i];
+        }
+    }
+    return start + (int64_t) shard * sh + (l - cum);
+}
+
+// Wave-shuffle + register Hadamard for p <= 32*E elements (lane l, reg e -> l + 32*e).
+template <int E>
+static __device__ __forceinline__ void hadamard_warp_stages(float (&v)[E], int p, int lane) {
+    const int hmax = p < 32 * E ? p : 32 * E;
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        if (h < hmax) {
+            const bool hi = (lane & h) != 0;
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const float o = ggml_cuda_shfl_xor(v[e], h);
+                v[e] = hi ? (o - v[e]) : (v[e] + o);
+            }
+        }
+    }
+#pragma unroll
+    for (int g = 1; g < E; g <<= 1) {
+        if (32 * g < hmax) {
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                if (!(e & g)) {
+                    const float a = v[e], b = v[e + g];
+                    v[e]     = a + b;
+                    v[e + g] = a - b;
+                }
+            }
+        }
     }
 }
 
-// Fast blockwise Hadamard for len in [128, 4096] (power of 2), blockDim.x = len / 4.
-// Fuses input gather + pre (when x != nullptr) or output post (when post != nullptr, writing to dst).
-static __global__ void k_input_block_fast(
-        int K, int len, float scale, int first, int ne1, int ne2, size_t nb1, size_t nb2, size_t nb3,
+// Wave-shuffle + register Hadamard for 128 elements (32 lanes x 4 elements: k = lane + 32*e).
+static __device__ __forceinline__ void hadamard_128_warp(float (&v)[4], int lane) {
+    hadamard_warp_stages<4>(v, 128, lane);
+}
+
+// 2-barrier padded-LDS transpose + wave-shuffle Hadamard for B in {256, 512, 1024, 2048, 4096}.
+// Leaves unnormalized H_B in tile[k / 32][k % 32] past the second barrier.
+template <int B, int THREADS>
+static __device__ __forceinline__ void rht_row_stages(
+        const float * __restrict__ src, const int32_t * __restrict__ pin, const float * __restrict__ pre,
+        int b0, float (&tile)[B / 32][33]) {
+    constexpr int VALUES = B / THREADS;
+    constexpr int COL = B < 1024 ? B / 32 : 32;
+    const int tid = threadIdx.x, lane = tid & 31;
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int k = tid + i * THREADS;
+        float v = src[pin ? pin[b0 + k] : (b0 + k)];
+        if (pre) {
+            v *= pre[b0 + k];
+        }
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float o = ggml_cuda_shfl_xor(v, h);
+            v = (lane & h) ? (o - v) : (v + o);
+        }
+        tile[k >> 5][lane] = v;
+    }
+    __syncthreads();
+    float v[VALUES];
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int t = tid + i * THREADS;
+        v[i] = tile[(t / (32 * COL)) * COL + (t % COL)][(t / COL) & 31];
+#pragma unroll
+        for (int h = 1; h < COL; h <<= 1) {
+            const float o = ggml_cuda_shfl_xor(v[i], h);
+            v[i] = (lane & h) ? (o - v[i]) : (v[i] + o);
+        }
+    }
+#pragma unroll
+    for (int step = 1024 / THREADS; step < VALUES; step <<= 1) {
+#pragma unroll
+        for (int i = 0; i < VALUES; ++i) {
+            if (!(i & step)) {
+                const float a = v[i], b = v[i + step];
+                v[i]        = a + b;
+                v[i + step] = a - b;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int t = tid + i * THREADS;
+        tile[(t / (32 * COL)) * COL + (t % COL)][(t / COL) & 31] = v[i];
+    }
+    __syncthreads();
+}
+
+// Fast blockwise input Hadamard for B = 128 (0 LDS, 0 barriers) and B in {256..4096} (2 barriers).
+static __global__ void k_input_rht_128(
+        int K, float scale, int first, int ne1, int ne2, size_t nb1, size_t nb2, size_t nb3,
         const char * __restrict__ x, const float * __restrict__ pre, const int32_t * __restrict__ pin,
         float * __restrict__ dst) {
-    extern __shared__ float sm[];
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int b0 = blockIdx.x * len;
+    const int lane = threadIdx.x & 31;
+    const int b0 = blockIdx.x * 128;
     const int64_t c = first + blockIdx.y;
     const float * row = (const float *) (x + (c % ne1) * nb1 + ((c / ne1) % ne2) * nb2 + (c / ((int64_t) ne1 * ne2)) * nb3);
     float v[4];
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-        const int i = warp * 128 + lane + 32 * e;
-        const int k = b0 + i;
+        const int k = b0 + lane + 32 * e;
         v[e] = row[pin ? pin[k] : k] * pre[k];
     }
     hadamard_128_warp(v, lane);
     const int64_t dst_base = (int64_t) blockIdx.y * K + b0;
-    if (len == 128) {
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            dst[dst_base + lane + 32 * e] = v[e] * scale;
-        }
-        return;
-    }
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-        sm[warp * 128 + lane + 32 * e] = v[e];
-    }
-    __syncthreads();
-    for (int h = 128; h < len; h <<= 1) {
-        const int half = len >> 1;
-        const int mask = h - 1;
-        for (int j = threadIdx.x; j < half; j += blockDim.x) {
-            const int i = ((j & ~mask) << 1) | (j & mask);
-            const float a = sm[i], b = sm[i + h];
-            sm[i]     = a + b;
-            sm[i + h] = a - b;
-        }
-        __syncthreads();
-    }
-#pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        const int i = warp * 128 + lane + 32 * e;
-        dst[dst_base + i] = sm[i] * scale;
+        dst[dst_base + lane + 32 * e] = v[e] * scale;
     }
 }
 
-static __global__ void k_output_block_fast(
-        int N, int len, float scale, int first, const float * __restrict__ src,
+template <int B, int THREADS>
+static __global__ void __launch_bounds__(THREADS) k_input_rht(
+        int K, float scale, int first, int ne1, int ne2, size_t nb1, size_t nb2, size_t nb3,
+        const char * __restrict__ x, const float * __restrict__ pre, const int32_t * __restrict__ pin,
+        float * __restrict__ dst) {
+    __shared__ float tile[B / 32][33];
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int b0 = blockIdx.x * B;
+    const int64_t c = first + blockIdx.y;
+    const float * row = (const float *) (x + (c % ne1) * nb1 + ((c / ne1) % ne2) * nb2 + (c / ((int64_t) ne1 * ne2)) * nb3);
+    rht_row_stages<B, THREADS>(row, pin, pre, b0, tile);
+    const int64_t dst_base = (int64_t) blockIdx.y * K + b0;
+#pragma unroll
+    for (int i = 0; i < B / THREADS; ++i) {
+        const int k = tid + i * THREADS;
+        dst[dst_base + k] = tile[k >> 5][lane] * scale;
+    }
+}
+
+// Fast blockwise output Hadamard for B = 128 and B in {256..4096}; fuses post even when src == dst.
+static __global__ void k_output_rht_128(
+        int N, float scale, int first, const float * __restrict__ src,
         const float * __restrict__ post, float * __restrict__ dst) {
-    extern __shared__ float sm[];
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int b0 = blockIdx.x * len;
+    const int lane = threadIdx.x & 31;
+    const int b0 = blockIdx.x * 128;
     const int64_t src_base = (int64_t) blockIdx.y * N + b0;
     float v[4];
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-        v[e] = src[src_base + warp * 128 + lane + 32 * e];
+        v[e] = src[src_base + lane + 32 * e];
     }
     hadamard_128_warp(v, lane);
     const int64_t dst_base = (int64_t) (first + blockIdx.y) * N + b0;
-    if (len == 128) {
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const int i = lane + 32 * e;
-            dst[dst_base + i] = v[e] * scale * (post ? post[b0 + i] : 1.0f);
-        }
+    for (int e = 0; e < 4; ++e) {
+        const int i = lane + 32 * e;
+        dst[dst_base + i] = post ? v[e] * scale * post[b0 + i] : v[e] * scale;
+    }
+}
+
+template <int B, int THREADS>
+static __global__ void __launch_bounds__(THREADS) k_output_rht(
+        int N, float scale, int first, const float * __restrict__ src,
+        const float * __restrict__ post, float * __restrict__ dst) {
+    __shared__ float tile[B / 32][33];
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int b0 = blockIdx.x * B;
+    const float * srow = src + (int64_t) blockIdx.y * N;
+    rht_row_stages<B, THREADS>(srow, nullptr, nullptr, b0, tile);
+    const int64_t dst_base = (int64_t) (first + blockIdx.y) * N + b0;
+#pragma unroll
+    for (int i = 0; i < B / THREADS; ++i) {
+        const int k = tid + i * THREADS;
+        const float z = tile[k >> 5][lane] * scale;
+        dst[dst_base + k] = post ? z * post[b0 + k] : z;
+    }
+}
+
+// Warp-only blockwise Hadamard for small blocks (16, 32, 64), 0 LDS.
+template <int E>
+static __global__ void __launch_bounds__(256) k_block_warp(
+        int n, int rows, int block, float scale, int first_dst,
+        const float * __restrict__ src, const float * __restrict__ post, float * __restrict__ dst) {
+    constexpr int S = 32 * E;
+    const int lane = threadIdx.x & 31;
+    const int chunks = (n + S - 1) / S;
+    const int64_t item = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (item >= (int64_t) rows * chunks) {
         return;
     }
+    const int row = (int) (item / chunks);
+    const int k0 = (int) (item % chunks) * S;
+    const float * srow = src + (int64_t) row * n;
+    float v[E];
 #pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        sm[warp * 128 + lane + 32 * e] = v[e];
+    for (int e = 0; e < E; ++e) {
+        const int k = k0 + lane + 32 * e;
+        v[e] = k < n ? srow[k] : 0.0f;
     }
-    __syncthreads();
-    for (int h = 128; h < len; h <<= 1) {
-        const int half = len >> 1;
-        const int mask = h - 1;
-        for (int j = threadIdx.x; j < half; j += blockDim.x) {
-            const int i = ((j & ~mask) << 1) | (j & mask);
-            const float a = sm[i], b = sm[i + h];
-            sm[i]     = a + b;
-            sm[i + h] = a - b;
+    hadamard_warp_stages<E>(v, block, lane);
+    float * drow = dst + (int64_t) (first_dst + row) * n;
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
+        const int k = k0 + lane + 32 * e;
+        if (k < n) {
+            drow[k] = post ? v[e] * scale * post[k] : v[e] * scale;
         }
-        __syncthreads();
-    }
-#pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        const int i = warp * 128 + lane + 32 * e;
-        dst[dst_base + i] = sm[i] * scale * (post ? post[b0 + i] : 1.0f);
     }
 }
 
 // Fused MLP middle: output Hadamard + post on gate & up, SwiGLU, pre + input Hadamard for down.
-// Matches trellis_swiglu_rht in trellis.cu; blockDim.x = len / 4, smem = 2 * len * sizeof(float) for len > 128.
-static __global__ void k_swiglu_block_fast(
+static __global__ void k_swiglu_rht_128(
         const float * __restrict__ g, const float * __restrict__ u, float * __restrict__ xd,
-        int n, int len, float scale,
+        int n, float scale,
         const float * __restrict__ post_g, const float * __restrict__ post_u, const float * __restrict__ pre_d) {
-    extern __shared__ float sm[];
-    float * sg = sm;
-    float * su = sm + len;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int b0 = blockIdx.x * len;
+    const int lane = threadIdx.x & 31;
+    const int b0 = blockIdx.x * 128;
     const int64_t row_base = (int64_t) blockIdx.y * n + b0;
     float vg[4], vu[4];
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-        const int i = warp * 128 + lane + 32 * e;
+        const int i = lane + 32 * e;
         vg[e] = g[row_base + i];
         vu[e] = u[row_base + i];
     }
     hadamard_128_warp(vg, lane);
     hadamard_128_warp(vu, lane);
-    if (len > 128) {
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const int i = warp * 128 + lane + 32 * e;
-            sg[i] = vg[e];
-            su[i] = vu[e];
-        }
-        __syncthreads();
-        const int half = len >> 1;
-        for (int h = 128; h < len; h <<= 1) {
-            const int mask = h - 1;
-            for (int j = threadIdx.x; j < half; j += blockDim.x) {
-                const int i = ((j & ~mask) << 1) | (j & mask);
-                float a = sg[i], b = sg[i + h];
-                sg[i] = a + b; sg[i + h] = a - b;
-                a = su[i]; b = su[i + h];
-                su[i] = a + b; su[i + h] = a - b;
-            }
-            __syncthreads();
-        }
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const int i = warp * 128 + lane + 32 * e;
-            vg[e] = sg[i];
-            vu[e] = su[i];
-        }
-    }
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-        const int i = warp * 128 + lane + 32 * e;
+        const int i = lane + 32 * e;
         const float gv = vg[e] * scale * post_g[b0 + i];
         const float uv = vu[e] * scale * post_u[b0 + i];
         const float silu = gv / (1.0f + expf(-gv));
         vg[e] = (silu * uv) * pre_d[b0 + i];
     }
     hadamard_128_warp(vg, lane);
-    if (len == 128) {
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            xd[row_base + lane + 32 * e] = vg[e] * scale;
-        }
-        return;
-    }
-    __syncthreads();
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-        sg[warp * 128 + lane + 32 * e] = vg[e];
-    }
-    __syncthreads();
-    const int half = len >> 1;
-    for (int h = 128; h < len; h <<= 1) {
-        const int mask = h - 1;
-        for (int j = threadIdx.x; j < half; j += blockDim.x) {
-            const int i = ((j & ~mask) << 1) | (j & mask);
-            const float a = sg[i], b = sg[i + h];
-            sg[i] = a + b; sg[i + h] = a - b;
-        }
-        __syncthreads();
-    }
-#pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        const int i = warp * 128 + lane + 32 * e;
-        xd[row_base + i] = sg[i] * scale;
+        xd[row_base + lane + 32 * e] = vg[e] * scale;
     }
 }
 
-// blockwise Hadamard of `len` entries in LDS: stages h = 1, 2, 4, ... in order, then one scale
-static __global__ void k_block(side_args a, float * v) {
+template <int B, int THREADS>
+static __global__ void __launch_bounds__(THREADS) k_swiglu_rht(
+        const float * __restrict__ g, const float * __restrict__ u, float * __restrict__ xd,
+        int n, float scale,
+        const float * __restrict__ post_g, const float * __restrict__ post_u, const float * __restrict__ pre_d) {
+    __shared__ float tg[B / 32][33];
+    __shared__ float tu[B / 32][33];
+    constexpr int VALUES = B / THREADS;
+    constexpr int COL = B < 1024 ? B / 32 : 32;
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int b0 = blockIdx.x * B;
+    const int64_t row_base = (int64_t) blockIdx.y * n + b0;
+
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int k = tid + i * THREADS;
+        float vg = g[row_base + k];
+        float vu = u[row_base + k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float og = ggml_cuda_shfl_xor(vg, h);
+            const float ou = ggml_cuda_shfl_xor(vu, h);
+            vg = (lane & h) ? (og - vg) : (vg + og);
+            vu = (lane & h) ? (ou - vu) : (vu + ou);
+        }
+        tg[k >> 5][lane] = vg;
+        tu[k >> 5][lane] = vu;
+    }
+    __syncthreads();
+    float vg[VALUES], vu[VALUES];
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int t = tid + i * THREADS;
+        const int r0 = (t / (32 * COL)) * COL + (t % COL);
+        const int c0 = (t / COL) & 31;
+        vg[i] = tg[r0][c0];
+        vu[i] = tu[r0][c0];
+#pragma unroll
+        for (int h = 1; h < COL; h <<= 1) {
+            const float og = ggml_cuda_shfl_xor(vg[i], h);
+            const float ou = ggml_cuda_shfl_xor(vu[i], h);
+            vg[i] = (lane & h) ? (og - vg[i]) : (vg[i] + og);
+            vu[i] = (lane & h) ? (ou - vu[i]) : (vu[i] + ou);
+        }
+    }
+#pragma unroll
+    for (int step = 1024 / THREADS; step < VALUES; step <<= 1) {
+#pragma unroll
+        for (int i = 0; i < VALUES; ++i) {
+            if (!(i & step)) {
+                const float ag = vg[i], bg = vg[i + step];
+                vg[i] = ag + bg; vg[i + step] = ag - bg;
+                const float au = vu[i], bu = vu[i + step];
+                vu[i] = au + bu; vu[i + step] = au - bu;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int t = tid + i * THREADS;
+        const int r0 = (t / (32 * COL)) * COL + (t % COL);
+        const int c0 = (t / COL) & 31;
+        tg[r0][c0] = vg[i];
+        tu[r0][c0] = vu[i];
+    }
+    __syncthreads();
+
+    // SwiGLU + pre_d + first stage of down input Hadamard (overwriting tg)
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int k = tid + i * THREADS;
+        const float gv = tg[k >> 5][lane] * scale * post_g[b0 + k];
+        const float uv = tu[k >> 5][lane] * scale * post_u[b0 + k];
+        float v = (gv / (1.0f + expf(-gv)) * uv) * pre_d[b0 + k];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float o = ggml_cuda_shfl_xor(v, h);
+            v = (lane & h) ? (o - v) : (v + o);
+        }
+        vg[i] = v;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int k = tid + i * THREADS;
+        tg[k >> 5][lane] = vg[i];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int t = tid + i * THREADS;
+        vg[i] = tg[(t / (32 * COL)) * COL + (t % COL)][(t / COL) & 31];
+#pragma unroll
+        for (int h = 1; h < COL; h <<= 1) {
+            const float o = ggml_cuda_shfl_xor(vg[i], h);
+            vg[i] = (lane & h) ? (o - vg[i]) : (vg[i] + o);
+        }
+    }
+#pragma unroll
+    for (int step = 1024 / THREADS; step < VALUES; step <<= 1) {
+#pragma unroll
+        for (int i = 0; i < VALUES; ++i) {
+            if (!(i & step)) {
+                const float a = vg[i], b = vg[i + step];
+                vg[i] = a + b; vg[i + step] = a - b;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int t = tid + i * THREADS;
+        tg[(t / (32 * COL)) * COL + (t % COL)][(t / COL) & 31] = vg[i];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int k = tid + i * THREADS;
+        xd[row_base + k] = tg[k >> 5][lane] * scale;
+    }
+}
+
+// Fallback blockwise Hadamard in LDS for tiny blocks (2, 4, 8) or blocks > 4096 (8192, 16384).
+static __global__ void k_block(int n, int len, float scale, float * v) {
     extern __shared__ float sm[];
-    const int64_t base = (int64_t) blockIdx.y * a.n + (int64_t) blockIdx.x * a.len;
-    for (int i = threadIdx.x; i < a.len; i += blockDim.x) {
+    const int64_t base = (int64_t) blockIdx.y * n + (int64_t) blockIdx.x * len;
+    for (int i = threadIdx.x; i < len; i += blockDim.x) {
         sm[i] = v[base + i];
     }
     __syncthreads();
-    for (int h = 1; h < a.len; h *= 2) {
-        for (int j = threadIdx.x; j < a.len / 2; j += blockDim.x) {
-            const int i = (j / h) * (2 * h) + j % h;
+    for (int h = 1; h < len; h <<= 1) {
+        const int sh = __ffs(h) - 1;
+        for (int j = threadIdx.x; j < (len >> 1); j += blockDim.x) {
+            const int i = ((j >> sh) << (sh + 1)) | (j & (h - 1));
             const float x = sm[i], y = sm[i + h];
             sm[i]     = x + y;
             sm[i + h] = x - y;
         }
         __syncthreads();
     }
-    for (int i = threadIdx.x; i < a.len; i += blockDim.x) {
-        v[base + i] = sm[i] * a.scale;
+    for (int i = threadIdx.x; i < len; i += blockDim.x) {
+        v[base + i] = sm[i] * scale;
     }
 }
 
-// one butterfly stage over global memory; the last stage carries the run's normalisation
-static __global__ void k_butterfly(side_args a, float * v) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= a.len / 2) {
-        return;
+// Single-CTA LDS forward hadfull (len <= 12288): fuses x read + pin + pre, runs, and Paley cross in 1 launch.
+static __global__ void k_hf_lds_fwd(
+        int K, int len, int run, int m, float c_run, float c_m, hf_parts parts,
+        int first, int ne1, int ne2, size_t nb1, size_t nb2, size_t nb3,
+        const char * __restrict__ x, const float * __restrict__ pre, const int32_t * __restrict__ pin,
+        float * __restrict__ dst) {
+    extern __shared__ float sm[];
+    const int shard = blockIdx.x;
+    const int64_t c = first + blockIdx.y;
+    const float * row = (const float *) (x + (c % ne1) * nb1 + ((c / ne1) % ne2) * nb2 + (c / ((int64_t) ne1 * ne2)) * nb3);
+    for (int l = threadIdx.x; l < len; l += blockDim.x) {
+        const int64_t i = stored_part(parts, shard, l);
+        sm[l] = row[pin ? pin[i] : i] * pre[i];
     }
-    const int l = (idx / a.h) * (2 * a.h) + idx % a.h;
-    const int64_t j = (int64_t) blockIdx.z * a.n + stored(a, l,       blockIdx.y);
-    const int64_t k = (int64_t) blockIdx.z * a.n + stored(a, l + a.h, blockIdx.y);
-    const float x = v[j], y = v[k];
-    v[j] = (x + y) * a.scale;
-    v[k] = (x - y) * a.scale;
+    __syncthreads();
+    const int half = len >> 1;
+    for (int h = 1; h < run; h <<= 1) {
+        const int sh = __ffs(h) - 1;
+        const float sc = (h == (run >> 1)) ? c_run : 1.0f;
+        for (int idx = threadIdx.x; idx < half; idx += blockDim.x) {
+            const int lo = ((idx >> sh) << (sh + 1)) | (idx & (h - 1));
+            const float a = sm[lo], b = sm[lo + h];
+            sm[lo]     = (a + b) * sc;
+            sm[lo + h] = (a - b) * sc;
+        }
+        __syncthreads();
+    }
+    float * drow = dst + (int64_t) blockIdx.y * K;
+    if (m == 1) {
+        for (int l = threadIdx.x; l < len; l += blockDim.x) {
+            drow[stored_part(parts, shard, l)] = sm[l];
+        }
+    } else {
+        for (int idx = threadIdx.x; idx < len; idx += blockDim.x) {
+            const int r = idx / run, j = idx % run;
+            float sum = 0.0f;
+            for (int b = 0; b < m; ++b) {
+                const float v = sm[b * run + j];
+                sum += paley_entry(m, r, b) > 0 ? v : -v;
+            }
+            drow[stored_part(parts, shard, idx)] = sum * c_m;
+        }
+    }
 }
 
-// the Paley cross term H_m (x) I, m in 12, 20, 68
-static __global__ void k_cross(side_args a, const float * __restrict__ src, float * __restrict__ dst) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= a.len) {
+// Single-CTA LDS inverse hadfull (m==1 && len<=12288, or m>1 && len<=6144): cross + runs + post in 1 launch.
+static __global__ void k_hf_lds_inv(
+        int N, int len, int run, int m, float c_run, float c_m, hf_parts parts,
+        int first_dst, const float * __restrict__ src, const float * __restrict__ post, float * __restrict__ dst) {
+    extern __shared__ float sm[];
+    const int shard = blockIdx.x;
+    const float * srow = src + (int64_t) blockIdx.y * N;
+    for (int l = threadIdx.x; l < len; l += blockDim.x) {
+        sm[l] = srow[stored_part(parts, shard, l)];
+    }
+    __syncthreads();
+    float * buf = sm;
+    if (m > 1) {
+        buf = sm + len;
+        for (int idx = threadIdx.x; idx < len; idx += blockDim.x) {
+            const int r = idx / run, j = idx % run;
+            float sum = 0.0f;
+            for (int b = 0; b < m; ++b) {
+                const float v = sm[b * run + j];
+                sum += paley_entry(m, b, r) > 0 ? v : -v;
+            }
+            buf[idx] = sum * c_m;
+        }
+        __syncthreads();
+    }
+    const int half = len >> 1;
+    for (int h = 1; h < run; h <<= 1) {
+        const int sh = __ffs(h) - 1;
+        const float sc = (h == (run >> 1)) ? c_run : 1.0f;
+        for (int idx = threadIdx.x; idx < half; idx += blockDim.x) {
+            const int lo = ((idx >> sh) << (sh + 1)) | (idx & (h - 1));
+            const float a = buf[lo], b = buf[lo + h];
+            buf[lo]     = (a + b) * sc;
+            buf[lo + h] = (a - b) * sc;
+        }
+        __syncthreads();
+    }
+    float * drow = dst + (int64_t) (first_dst + blockIdx.y) * N;
+    for (int l = threadIdx.x; l < len; l += blockDim.x) {
+        const int64_t i = stored_part(parts, shard, l);
+        drow[i] = post ? buf[l] * post[i] : buf[l];
+    }
+}
+
+// 2-kernel fallback for large hadfull slices (len > 12288 fwd or > 6144 inv, up to 24576): in-place safe.
+template <int E>
+static __global__ void __launch_bounds__(256) k_hf_runs_warp(
+        int n, int rows, int shards, int len, int run, float c_run, hf_parts parts, int first_dst,
+        const float * __restrict__ src, const float * __restrict__ post, float * __restrict__ dst) {
+    constexpr int S = 32 * E;
+    const int lane = threadIdx.x & 31;
+    const int cps = (len + S - 1) / S;
+    const int64_t item = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (item >= (int64_t) rows * shards * cps) {
         return;
     }
-    const int row = idx / a.run, j = idx % a.run;
-    float sum = 0.0f;
-    for (int b = 0; b < a.m; ++b) {
-        const int r = a.inverse ? b : row, c = a.inverse ? row : b;
-        const int s = r == c ? 1 : r == 0 ? 1 : c == 0 ? -1 : chi(c - r, a.m - 1);
-        const float x = src[(int64_t) blockIdx.z * a.n + stored(a, b * a.run + j, blockIdx.y)];
-        sum += s > 0 ? x : -x;
+    const int row = (int) (item / ((int64_t) shards * cps));
+    const int shard = (int) ((item / cps) % shards);
+    const int k0 = (int) (item % cps) * S;
+    const float * srow = src + (int64_t) row * n;
+    float v[E];
+    int64_t at[E];
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
+        const int l = k0 + lane + 32 * e;
+        at[e] = l < len ? stored_part(parts, shard, l) : -1;
+        v[e] = at[e] >= 0 ? srow[at[e]] : 0.0f;
     }
-    dst[(int64_t) blockIdx.z * a.n + stored(a, idx, blockIdx.y)] = sum * a.scale;
+    hadamard_warp_stages<E>(v, run, lane);
+    float * drow = dst + (int64_t) (first_dst + row) * n;
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
+        if (at[e] >= 0) {
+            drow[at[e]] = post ? v[e] * c_run * post[at[e]] : v[e] * c_run;
+        }
+    }
+}
+
+static __global__ void k_hf_runs_cta(
+        int n, int run, float c_run, hf_parts parts, int first_dst,
+        const float * __restrict__ src, const float * __restrict__ post, float * __restrict__ dst) {
+    extern __shared__ float sm[];
+    const int k0 = blockIdx.x * run;
+    const int shard = blockIdx.y;
+    const float * srow = src + (int64_t) blockIdx.z * n;
+    for (int l = threadIdx.x; l < run; l += blockDim.x) {
+        sm[l] = srow[stored_part(parts, shard, k0 + l)];
+    }
+    __syncthreads();
+    const int half = run >> 1;
+    for (int h = 1; h < run; h <<= 1) {
+        const int sh = __ffs(h) - 1;
+        const float sc = (h == half) ? c_run : 1.0f;
+        for (int idx = threadIdx.x; idx < half; idx += blockDim.x) {
+            const int lo = ((idx >> sh) << (sh + 1)) | (idx & (h - 1));
+            const float a = sm[lo], b = sm[lo + h];
+            sm[lo]     = (a + b) * sc;
+            sm[lo + h] = (a - b) * sc;
+        }
+        __syncthreads();
+    }
+    float * drow = dst + (int64_t) (first_dst + blockIdx.z) * n;
+    for (int l = threadIdx.x; l < run; l += blockDim.x) {
+        const int64_t i = stored_part(parts, shard, k0 + l);
+        drow[i] = post ? sm[l] * post[i] : sm[l];
+    }
+}
+
+static __global__ void __launch_bounds__(1024) k_hf_cross(
+        int n, int m, int run, int g, float c_m, int transpose, hf_parts parts,
+        const float * __restrict__ src, float * __restrict__ dst) {
+    __shared__ float t[68 * 33];
+    const int ncol = run < g ? run : g;
+    const int j0 = blockIdx.x * g;
+    const int shard = blockIdx.y;
+    const float * srow = src + (int64_t) blockIdx.z * n;
+    for (int idx = threadIdx.x; idx < m * ncol; idx += blockDim.x) {
+        const int b = idx / ncol, jj = idx % ncol;
+        t[b * 33 + jj] = srow[stored_part(parts, shard, b * run + j0 + jj)];
+    }
+    __syncthreads();
+    float * drow = dst + (int64_t) blockIdx.z * n;
+    for (int idx = threadIdx.x; idx < m * ncol; idx += blockDim.x) {
+        const int a = idx / ncol, jj = idx % ncol;
+        float acc = 0.0f;
+        for (int b = 0; b < m; ++b) {
+            const int h = transpose ? paley_entry(m, b, a) : paley_entry(m, a, b);
+            const float v = t[b * 33 + jj];
+            acc += h > 0 ? v : -v;
+        }
+        drow[stored_part(parts, shard, a * run + j0 + jj)] = acc * c_m;
+    }
 }
 
 // ---- input / output ------------------------------------------------------------------------------------
@@ -417,7 +742,7 @@ static __global__ void k_input(int K, int first, int ne1, int ne2, size_t nb1, s
     dst[(int64_t) blockIdx.y * K + k] = ((const float *) row)[pin ? pin[k] : k] * pre[k];
 }
 
-// dst[(first + t)*N + n] = y[t*N + j] * post[j], j = pout ? pout[n] : n
+// dst[(first + t)*N + n] = y[t*N + j] * (post ? post[j] : 1), j = pout ? pout[n] : n
 static __global__ void k_output(int N, int first, const float * __restrict__ y, const float * __restrict__ post,
                                 const int32_t * __restrict__ pout, float * __restrict__ dst) {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
@@ -425,59 +750,191 @@ static __global__ void k_output(int N, int first, const float * __restrict__ y, 
         return;
     }
     const int j = pout ? pout[n] : n;
-    dst[(int64_t) (first + blockIdx.y) * N + n] = y[(int64_t) blockIdx.y * N + j] * post[j];
+    const float v = y[(int64_t) blockIdx.y * N + j];
+    dst[(int64_t) (first + blockIdx.y) * N + n] = post ? v * post[j] : v;
+}
+
+// Batched output gather for input groups (post already applied by output side).
+struct gather_seg {
+    const float * src;
+    const int32_t * idx;
+    float * dst;
+    int n;
+};
+struct gather_set {
+    gather_seg seg[TRELLIS_GROUP_MAX];
+};
+
+static __global__ void k_gather_multi(gather_set set, int first) {
+    const gather_seg g = set.seg[blockIdx.z];
+    const int64_t t = blockIdx.y;
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < g.n; j += gridDim.x * blockDim.x) {
+        g.dst[(first + t) * g.n + j] = g.src[t * g.n + g.idx[j]];
+    }
+}
+
+// Batched input prepare for input groups sharing x and blockwise rht (pin == nullptr).
+struct group_in_args {
+    const float * pre[TRELLIS_GROUP_MAX];
+    float * dst[TRELLIS_GROUP_MAX];
+    int n;
+};
+
+static __global__ void k_input_group_rht_128(
+        int K, float scale, int first, int ne1, int ne2, size_t nb1, size_t nb2, size_t nb3,
+        const char * __restrict__ x, group_in_args g) {
+    const int lane = threadIdx.x & 31;
+    const int b0 = blockIdx.x * 128;
+    const int64_t c = first + blockIdx.y;
+    const float * row = (const float *) (x + (c % ne1) * nb1 + ((c / ne1) % ne2) * nb2 + (c / ((int64_t) ne1 * ne2)) * nb3);
+    float xr[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        xr[e] = row[b0 + lane + 32 * e];
+    }
+    const int64_t dst_base = (int64_t) blockIdx.y * K + b0;
+    for (int m = 0; m < g.n; ++m) {
+        float v[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int k = b0 + lane + 32 * e;
+            v[e] = xr[e] * g.pre[m][k];
+        }
+        hadamard_128_warp(v, lane);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            g.dst[m][dst_base + lane + 32 * e] = v[e] * scale;
+        }
+    }
+}
+
+template <int B, int THREADS>
+static __global__ void __launch_bounds__(THREADS) k_input_group_rht(
+        int K, float scale, int first, int ne1, int ne2, size_t nb1, size_t nb2, size_t nb3,
+        const char * __restrict__ x, group_in_args g) {
+    __shared__ float tile[B / 32][33];
+    constexpr int VALUES = B / THREADS;
+    constexpr int COL = B < 1024 ? B / 32 : 32;
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int b0 = blockIdx.x * B;
+    const int64_t c = first + blockIdx.y;
+    const float * row = (const float *) (x + (c % ne1) * nb1 + ((c / ne1) % ne2) * nb2 + (c / ((int64_t) ne1 * ne2)) * nb3);
+    float xr[VALUES];
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        xr[i] = row[b0 + tid + i * THREADS];
+    }
+    const int64_t dst_base = (int64_t) blockIdx.y * K + b0;
+    for (int m = 0; m < g.n; ++m) {
+#pragma unroll
+        for (int i = 0; i < VALUES; ++i) {
+            const int k = tid + i * THREADS;
+            float v = xr[i] * g.pre[m][b0 + k];
+#pragma unroll
+            for (int h = 1; h < 32; h <<= 1) {
+                const float o = ggml_cuda_shfl_xor(v, h);
+                v = (lane & h) ? (o - v) : (v + o);
+            }
+            tile[k >> 5][lane] = v;
+        }
+        __syncthreads();
+        float v[VALUES];
+#pragma unroll
+        for (int i = 0; i < VALUES; ++i) {
+            const int t = tid + i * THREADS;
+            v[i] = tile[(t / (32 * COL)) * COL + (t % COL)][(t / COL) & 31];
+#pragma unroll
+            for (int h = 1; h < COL; h <<= 1) {
+                const float o = ggml_cuda_shfl_xor(v[i], h);
+                v[i] = (lane & h) ? (o - v[i]) : (v[i] + o);
+            }
+        }
+#pragma unroll
+        for (int step = 1024 / THREADS; step < VALUES; step <<= 1) {
+#pragma unroll
+            for (int i = 0; i < VALUES; ++i) {
+                if (!(i & step)) {
+                    const float a = v[i], b = v[i + step];
+                    v[i] = a + b; v[i + step] = a - b;
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < VALUES; ++i) {
+            const int t = tid + i * THREADS;
+            tile[(t / (32 * COL)) * COL + (t % COL)][(t / COL) & 31] = v[i];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < VALUES; ++i) {
+            const int k = tid + i * THREADS;
+            g.dst[m][dst_base + k] = tile[k >> 5][lane] * scale;
+        }
+        if (m + 1 < g.n) {
+            __syncthreads();
+        }
+    }
+}
+
+// Batched output rht for input groups sharing the same rows_block in [128, 4096].
+struct group_out_args {
+    const float * src[TRELLIS_GROUP_MAX];
+    const float * post[TRELLIS_GROUP_MAX];
+    float * dst[TRELLIS_GROUP_MAX];
+    int N[TRELLIS_GROUP_MAX];
+    int cta0[TRELLIS_GROUP_MAX + 1];
+    int n;
+    int first_dst[TRELLIS_GROUP_MAX];
+};
+
+static __global__ void k_output_group_rht_128(group_out_args g, float scale) {
+    int m = 0;
+#pragma unroll
+    for (int i = 1; i < TRELLIS_GROUP_MAX; ++i) {
+        if (i < g.n && (int) blockIdx.x >= g.cta0[i]) { m = i; }
+    }
+    const int lane = threadIdx.x & 31;
+    const int b0 = ((int) blockIdx.x - g.cta0[m]) * 128;
+    const int64_t src_base = (int64_t) blockIdx.y * g.N[m] + b0;
+    float v[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        v[e] = g.src[m][src_base + lane + 32 * e];
+    }
+    hadamard_128_warp(v, lane);
+    const int64_t dst_base = (int64_t) (g.first_dst[m] + blockIdx.y) * g.N[m] + b0;
+    const float * post = g.post[m];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int i = lane + 32 * e;
+        g.dst[m][dst_base + i] = post ? v[e] * scale * post[b0 + i] : v[e] * scale;
+    }
+}
+
+template <int B, int THREADS>
+static __global__ void __launch_bounds__(THREADS) k_output_group_rht(group_out_args g, float scale) {
+    __shared__ float tile[B / 32][33];
+    int m = 0;
+#pragma unroll
+    for (int i = 1; i < TRELLIS_GROUP_MAX; ++i) {
+        if (i < g.n && (int) blockIdx.x >= g.cta0[i]) { m = i; }
+    }
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int b0 = ((int) blockIdx.x - g.cta0[m]) * B;
+    const float * srow = g.src[m] + (int64_t) blockIdx.y * g.N[m];
+    rht_row_stages<B, THREADS>(srow, nullptr, nullptr, b0, tile);
+    const int64_t dst_base = (int64_t) (g.first_dst[m] + blockIdx.y) * g.N[m] + b0;
+    const float * post = g.post[m];
+#pragma unroll
+    for (int i = 0; i < B / THREADS; ++i) {
+        const int k = tid + i * THREADS;
+        const float z = tile[k >> 5][lane] * scale;
+        g.dst[m][dst_base + k] = post ? z * post[b0 + k] : z;
+    }
 }
 
 // ---- the product ---------------------------------------------------------------------------------------
 
-// Four output rows per workgroup (one per wave); each lane walks K in steps of 32, decoding one
-// weight per step, and accumulates COLS token columns. fp32 throughout.
-template <int BITS, int COLS>
-static __global__ void __launch_bounds__(128) k_product(
-        const uint32_t * __restrict__ codes, const half * __restrict__ s16,
-        const float * __restrict__ x, float * __restrict__ y, int K, int N, int batch) {
-    constexpr int NW = 8 * BITS, TOTAL = 256 * BITS;
-    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int row  = 4 * blockIdx.x + wave;
-    const int column = COLS * blockIdx.y;
-    if (row >= N) {
-        return;
-    }
-    // the lane's within-tile column is k % 16 == lane % 16, constant across the k loop
-    const int p = ring_pos(row % 16, lane % 16);
-    const int start = ((p + 1) * BITS + TOTAL - 16) % TOTAL;
-    const int word = start / 32, off = start % 32;
-    const int kt = K / 16;
-    const uint32_t * tiles = codes + (int64_t) (row / 16) * kt * NW;
-
-    float sum[COLS] = {};
-    for (int k = lane; k < K; k += 32) {
-        const uint32_t * tile = tiles + (int64_t) (k / 16) * NW;
-        const float w = grid_value(state_at<BITS>(tile, word, off)) * __half2float(s16[k / 16]);
-#pragma unroll
-        for (int j = 0; j < COLS; ++j) {
-            if (column + j < batch) {
-                sum[j] += w * x[(int64_t) (column + j) * K + k];
-            }
-        }
-    }
-#pragma unroll
-    for (int j = 0; j < COLS; ++j) {
-#pragma unroll
-        for (int off2 = 16; off2 > 0; off2 >>= 1) {
-            sum[j] += ggml_cuda_shfl_xor(sum[j], off2);
-        }
-        if (lane == 0 && column + j < batch) {
-            y[(int64_t) (column + j) * N + row] = sum[j];
-        }
-    }
-}
-
-// Decode GEMV for one token: a lane decodes the 8 ring positions p = 8a + j (j = 0..7), which are
-// row a/4 at columns 2q, 2q+1, 2q+8, 2q+9 and row a/4 + 8 at the same columns (q = a%4). So one
-// tile visit yields two rows x four columns, the block scale is loaded once per tile, and the
-// activations are read as float2 pairs. Four waves cover the 16 rows; lane/8 gives four
-// independent K partitions that are summed at the end.
 // The 8 windows of positions 8a..8a+7 are consecutive, so a few 32-bit anchors cover them all:
 // one anchor holds SPAN = 16/BITS + 1 consecutive windows. This is libtrellis's Plan<K> scheme
 // (ggml-cuda/libtrellis/src/common.cuh); it needs ANCH word pairs instead of 8.
@@ -508,7 +965,13 @@ static __device__ __forceinline__ uint32_t anchored_state(const uint32_t (&r)[an
     constexpr int A      = (7 - I) / SPAN;
     constexpr int ANCHOR = 7 - A * SPAN;
     constexpr int C      = (ANCHOR - I) * BITS;
-    return (r[A] >> C) & 0xFFFFu;
+    if constexpr (C == 0) {
+        return r[A] & 0xFFFFu;
+    } else if constexpr (C == 16) {
+        return r[A] >> 16;
+    } else {
+        return __builtin_amdgcn_ubfe(r[A], C, 16);
+    }
 }
 
 template <int BITS>
@@ -529,85 +992,349 @@ static __device__ __forceinline__ void decode8_plan(const uint32_t * tile, const
     v[7] = grid_value(anchored_state<BITS, 7>(r));
 }
 
-template <int BITS>
-static __device__ __forceinline__ void decode8(const uint32_t * tile, int a, float * v) {
-    decode8_plan<BITS>(tile, anchor_plan<BITS>::make(a), v);
-}
+// Decode GEMV v2: 8 waves per WG (128 output rows/WG), each wave owns 1 output tile (16 rows).
+// Cooperatively stages CK k-tiles of (x * s16) into LDS once for all 8 waves; each wave loads 4
+// consecutive k-tiles with BITS fully-coalesced 128-byte wave loads into wave-local LDS.
+// Supports COLS in {1, 2, 4, 8}, Split-K (when splits > 1), and fused had128/post epilogue (when COLS == 1 && splits == 1).
+constexpr float H128_SCALE = 0.08838834764831845f; // 128^-0.5
 
 template <int BITS, int COLS>
-static __global__ void __launch_bounds__(128) k_product_mv(
+static __device__ __forceinline__ void mv_v2_body(
         const uint32_t * __restrict__ codes, const half * __restrict__ s16,
-        const float * __restrict__ x, float * __restrict__ y, int K, int N, int batch) {
+        const float * __restrict__ x, float * __restrict__ y,
+        const float * __restrict__ post, int fuse_mode,
+        int K, int N, int batch, int wg_tile_base, int col0, int split, int splits) {
     constexpr int NW = 8 * BITS;
-    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int tile_row = blockIdx.x;
-    const int col0 = COLS * blockIdx.y;
-    const int q = lane % 4;
-    const int c = 2 * q;
-    const int a = 8 * wave + (lane % 8);
-    const int row = 16 * tile_row + a / 4;
-    const int kt = K / 16;
-    const uint32_t * tiles = codes + (int64_t) tile_row * kt * NW;
+    constexpr int ANCH = anchor_plan<BITS>::ANCH;
+    constexpr int CK = COLS == 1 ? 16 : (COLS <= 4 ? 8 : 4);
 
-    float4 s0[COLS], s1[COLS];
+    __shared__ float sx[COLS][CK * 16];
+    __shared__ uint32_t sm_code[8][32 * BITS];
+
+    const int tid  = threadIdx.x;
+    const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+    const int lane = tid & 31;
+    const int r = lane >> 2;
+    const int c = (lane & 3) << 1;
+    const int kt = K >> 4;
+
+    const int kt_per_split = (((kt + splits - 1) / splits) + 3) & ~3;
+    const int kb_start = split * kt_per_split;
+    const int kb_end   = min(kb_start + kt_per_split, kt);
+
+    const int tile_row = wg_tile_base + wave;
+    const bool live = (tile_row << 4) < N;
+    const uint32_t * tiles = codes + (int64_t) tile_row * kt * NW;
+    const anchor_plan<BITS> plan = anchor_plan<BITS>::make(lane);
+
+    float sum0[COLS] = {};
+    float sum1[COLS] = {};
+
+    for (int kb0 = kb_start; kb0 < kb_end; kb0 += CK) {
+        const int jn = min(CK, kb_end - kb0);
+        // Cooperatively stage jn k-tiles of x * s16 into LDS
+        constexpr int TOTAL_X = COLS * CK * 16;
 #pragma unroll
-    for (int t = 0; t < COLS; ++t) {
-        s0[t] = make_float4(0.f, 0.f, 0.f, 0.f);
-        s1[t] = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int idx = tid; idx < TOTAL_X; idx += 256) {
+            const int col = idx / (CK * 16);
+            const int rem = idx % (CK * 16);
+            const int jt  = rem >> 4;
+            if (jt < jn && col0 + col < batch) {
+                const float s = __half2float(s16[kb0 + jt]);
+                sx[col][rem] = x[(int64_t) (col0 + col) * K + ((kb0 + jt) << 4) + (rem & 15)] * s;
+            } else {
+                sx[col][rem] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        if (live) {
+            const int n4 = jn >> 2;
+            const uint32_t * tile_ptr = tiles + (int64_t) kb0 * NW;
+
+            auto accum_one_tile = [&](const uint32_t * sm_t, int jt) {
+                uint32_t rbuf[ANCH];
+#pragma unroll
+                for (int a = 0; a < ANCH; ++a) {
+                    rbuf[a] = __funnelshift_rc(sm_t[plan.w1[a]], sm_t[plan.w0[a]], plan.sh[a]);
+                }
+                const float w0 = grid_value(anchored_state<BITS, 0>(rbuf));
+                const float w1 = grid_value(anchored_state<BITS, 1>(rbuf));
+                const float w2 = grid_value(anchored_state<BITS, 2>(rbuf));
+                const float w3 = grid_value(anchored_state<BITS, 3>(rbuf));
+                const float w4 = grid_value(anchored_state<BITS, 4>(rbuf));
+                const float w5 = grid_value(anchored_state<BITS, 5>(rbuf));
+                const float w6 = grid_value(anchored_state<BITS, 6>(rbuf));
+                const float w7 = grid_value(anchored_state<BITS, 7>(rbuf));
+#pragma unroll
+                for (int col = 0; col < COLS; ++col) {
+                    const float2 x0 = *reinterpret_cast<const float2 *>(&sx[col][(jt << 4) + c]);
+                    const float2 x1 = *reinterpret_cast<const float2 *>(&sx[col][(jt << 4) + c + 8]);
+                    sum0[col] = fmaf(w0, x0.x, fmaf(w1, x0.y, fmaf(w2, x1.x, fmaf(w3, x1.y, sum0[col]))));
+                    sum1[col] = fmaf(w4, x0.x, fmaf(w5, x0.y, fmaf(w6, x1.x, fmaf(w7, x1.y, sum1[col]))));
+                }
+            };
+
+            if (n4 > 0) {
+                uint32_t cur_buf[BITS];
+#pragma unroll
+                for (int u = 0; u < BITS; ++u) {
+                    cur_buf[u] = tile_ptr[u * 32 + lane];
+                }
+                for (int g = 0; g < n4; ++g) {
+                    uint32_t next_buf[BITS];
+                    if (g + 1 < n4) {
+                        const uint32_t * next_ptr = tile_ptr + (g + 1) * (4 * NW);
+#pragma unroll
+                        for (int u = 0; u < BITS; ++u) {
+                            next_buf[u] = next_ptr[u * 32 + lane];
+                        }
+                    }
+#pragma unroll
+                    for (int u = 0; u < BITS; ++u) {
+                        sm_code[wave][u * 32 + lane] = cur_buf[u];
+                    }
+                    asm volatile("" ::: "memory");
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        accum_one_tile(&sm_code[wave][t * NW], g * 4 + t);
+                    }
+                    if (g + 1 < n4) {
+#pragma unroll
+                        for (int u = 0; u < BITS; ++u) {
+                            cur_buf[u] = next_buf[u];
+                        }
+                    }
+                }
+            }
+
+            // Tail tiles (jn % 4)
+            for (int jt = n4 * 4; jt < jn; ++jt) {
+                const uint32_t * tp = tile_ptr + jt * NW;
+#pragma unroll
+                for (int u = lane; u < NW; u += 32) {
+                    sm_code[wave][u] = tp[u];
+                }
+                asm volatile("" ::: "memory");
+                accum_one_tile(sm_code[wave], jt);
+            }
+        }
+        __syncthreads();
     }
-    for (int i = lane / 8; i < kt; i += 4) {
-        const uint32_t * tile = tiles + (int64_t) i * NW;
-        float v[8];
-        decode8<BITS>(tile, a, v);
-        const float s = __half2float(s16[i]);
-        const float w0 = v[0] * s, w1 = v[1] * s, w2 = v[2] * s, w3 = v[3] * s;
-        const float w4 = v[4] * s, w5 = v[5] * s, w6 = v[6] * s, w7 = v[7] * s;
+
+    // Reduce 4 column groups within each wave
 #pragma unroll
-        for (int t = 0; t < COLS; ++t) {
-            if (col0 + t < batch) {
-                const float * xt = x + (int64_t) (col0 + t) * K + 16 * i + c;
-                const float2 x0 = *reinterpret_cast<const float2 *>(xt);
-                const float2 x1 = *reinterpret_cast<const float2 *>(xt + 8);
-                s0[t].x += w0 * x0.x;
-                s0[t].y += w1 * x0.y;
-                s0[t].z += w2 * x1.x;
-                s0[t].w += w3 * x1.y;
-                s1[t].x += w4 * x0.x;
-                s1[t].y += w5 * x0.y;
-                s1[t].z += w6 * x1.x;
-                s1[t].w += w7 * x1.y;
+    for (int col = 0; col < COLS; ++col) {
+        sum0[col] += ggml_cuda_shfl_xor(sum0[col], 1);
+        sum0[col] += ggml_cuda_shfl_xor(sum0[col], 2);
+        sum1[col] += ggml_cuda_shfl_xor(sum1[col], 1);
+        sum1[col] += ggml_cuda_shfl_xor(sum1[col], 2);
+    }
+
+    if constexpr (COLS == 1) {
+        if (splits == 1 && fuse_mode == 2) {
+            // Fused output rht128 + post across all 8 waves (128 rows)
+            if (live && (lane & 3) == 0) {
+                sx[0][wave * 16 + r]     = sum0[0];
+                sx[0][wave * 16 + r + 8] = sum1[0];
+            }
+            __syncthreads();
+            if (wave == 0) {
+                const int row_base = wg_tile_base << 4;
+                float v[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    v[e] = sx[0][lane + 32 * e];
+                }
+                hadamard_128_warp(v, lane);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int i = lane + 32 * e;
+                    y[row_base + i] = v[e] * H128_SCALE * post[row_base + i];
+                }
+            }
+            return;
+        }
+        if (live && (lane & 3) == 0) {
+            const int row0 = (tile_row << 4) + r;
+            const int row1 = row0 + 8;
+            float * y_out = splits > 1 ? (y + (int64_t) split * N) : y;
+            if (splits == 1 && fuse_mode == 1) {
+                if (row0 < N) { y_out[row0] = sum0[0] * post[row0]; }
+                if (row1 < N) { y_out[row1] = sum1[0] * post[row1]; }
+            } else {
+                if (row0 < N) { y_out[row0] = sum0[0]; }
+                if (row1 < N) { y_out[row1] = sum1[0]; }
+            }
+        }
+    } else {
+        if (live && (lane & 3) == 0) {
+            const int row0 = (tile_row << 4) + r;
+            const int row1 = row0 + 8;
+#pragma unroll
+            for (int col = 0; col < COLS; ++col) {
+                if (col0 + col < batch) {
+                    float * y_row = y + (int64_t) (col0 + col) * N;
+                    if (row0 < N) { y_row[row0] = sum0[col]; }
+                    if (row1 < N) { y_row[row1] = sum1[col]; }
+                }
             }
         }
     }
-    // sum the four K partitions (lane/8), then the four column groups (lane%4)
-#pragma unroll
-    for (int t = 0; t < COLS; ++t) {
-#pragma unroll
-        for (int off = 8; off <= 16; off *= 2) {
-            s0[t].x += ggml_cuda_shfl_xor(s0[t].x, off);
-            s0[t].y += ggml_cuda_shfl_xor(s0[t].y, off);
-            s0[t].z += ggml_cuda_shfl_xor(s0[t].z, off);
-            s0[t].w += ggml_cuda_shfl_xor(s0[t].w, off);
-            s1[t].x += ggml_cuda_shfl_xor(s1[t].x, off);
-            s1[t].y += ggml_cuda_shfl_xor(s1[t].y, off);
-            s1[t].z += ggml_cuda_shfl_xor(s1[t].z, off);
-            s1[t].w += ggml_cuda_shfl_xor(s1[t].w, off);
+}
+
+template <int BITS, int COLS>
+static __global__ void __launch_bounds__(256) k_product_mv_v2(
+        const uint32_t * __restrict__ codes, const half * __restrict__ s16,
+        const float * __restrict__ x, float * __restrict__ y,
+        const float * __restrict__ post, int fuse_mode,
+        int K, int N, int batch, int splits) {
+    if constexpr (COLS == 1) {
+        mv_v2_body<BITS, 1>(codes, s16, x, y, post, fuse_mode, K, N, 1, 8 * blockIdx.x, 0, blockIdx.y, splits);
+    } else {
+        mv_v2_body<BITS, COLS>(codes, s16, x, y, nullptr, 0, K, N, batch, 8 * blockIdx.x, COLS * blockIdx.y, 0, 1);
+    }
+}
+
+// Deterministic Split-K reduction for batch == 1; optionally fuses post (fuse_mode==1) or had128+post (fuse_mode==2).
+static __global__ void __launch_bounds__(128) k_splitk_reduce(
+        const float * __restrict__ partials, const float * __restrict__ post, float * __restrict__ dst,
+        int N, int splits, int fuse_mode) {
+    const int row = blockIdx.x * 128 + threadIdx.x;
+    float acc = 0.0f;
+    if (row < N) {
+        for (int s = 0; s < splits; ++s) {
+            acc += partials[(int64_t) s * N + row];
         }
+    }
+    if (fuse_mode == 2) {
+        __shared__ float sm[128];
+        sm[threadIdx.x] = acc;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            const int lane = threadIdx.x;
+            const int row_base = blockIdx.x * 128;
+            float v[4];
 #pragma unroll
-        for (int off = 1; off <= 2; off *= 2) {
-            s0[t].x += ggml_cuda_shfl_xor(s0[t].x, off);
-            s0[t].y += ggml_cuda_shfl_xor(s0[t].y, off);
-            s0[t].z += ggml_cuda_shfl_xor(s0[t].z, off);
-            s0[t].w += ggml_cuda_shfl_xor(s0[t].w, off);
-            s1[t].x += ggml_cuda_shfl_xor(s1[t].x, off);
-            s1[t].y += ggml_cuda_shfl_xor(s1[t].y, off);
-            s1[t].z += ggml_cuda_shfl_xor(s1[t].z, off);
-            s1[t].w += ggml_cuda_shfl_xor(s1[t].w, off);
+            for (int e = 0; e < 4; ++e) {
+                v[e] = sm[lane + 32 * e];
+            }
+            hadamard_128_warp(v, lane);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int i = lane + 32 * e;
+                dst[row_base + i] = v[e] * H128_SCALE * post[row_base + i];
+            }
         }
-        if (lane < 8 && q == 0 && col0 + t < batch) {
-            y[(int64_t) (col0 + t) * N + row]     = s0[t].x + s0[t].y + s0[t].z + s0[t].w;
-            y[(int64_t) (col0 + t) * N + row + 8] = s1[t].x + s1[t].y + s1[t].z + s1[t].w;
+        return;
+    }
+    if (row < N) {
+        dst[row] = fuse_mode == 1 ? (acc * post[row]) : acc;
+    }
+}
+
+struct mv1_group_member {
+    const uint32_t * codes;
+    const half * s16;
+    const float * x;
+    float * y;
+    const float * post;
+    int fuse_mode;
+    int N;
+    int bits;
+};
+
+struct mv1_group_args {
+    mv1_group_member m[TRELLIS_GROUP_MAX];
+    int cta0[TRELLIS_GROUP_MAX + 1]; // cumulative WG count: (N + 127) / 128
+    int n;
+    int K;
+    int splits;
+};
+
+template <int BITS>
+static __global__ void __launch_bounds__(256) k_product_mv1_group(mv1_group_args g) {
+    int mi = 0;
+#pragma unroll
+    for (int i = 1; i < TRELLIS_GROUP_MAX; ++i) {
+        if (i < g.n && (int) blockIdx.x >= g.cta0[i]) { mi = i; }
+    }
+    const mv1_group_member & m = g.m[mi];
+    const int wg_idx = (int) blockIdx.x - g.cta0[mi];
+    mv_v2_body<BITS, 1>(m.codes, m.s16, m.x, m.y, m.post, m.fuse_mode, g.K, m.N, 1, 8 * wg_idx, 0, blockIdx.y, g.splits);
+}
+
+static __global__ void __launch_bounds__(256) k_product_mv1_mixed_group(mv1_group_args g) {
+    int mi = 0;
+#pragma unroll
+    for (int i = 1; i < TRELLIS_GROUP_MAX; ++i) {
+        if (i < g.n && (int) blockIdx.x >= g.cta0[i]) { mi = i; }
+    }
+    const mv1_group_member & m = g.m[mi];
+    const int wg_idx = (int) blockIdx.x - g.cta0[mi];
+    switch (m.bits) {
+        case 1: mv_v2_body<1, 1>(m.codes, m.s16, m.x, m.y, m.post, m.fuse_mode, g.K, m.N, 1, 8 * wg_idx, 0, blockIdx.y, g.splits); break;
+        case 2: mv_v2_body<2, 1>(m.codes, m.s16, m.x, m.y, m.post, m.fuse_mode, g.K, m.N, 1, 8 * wg_idx, 0, blockIdx.y, g.splits); break;
+        case 3: mv_v2_body<3, 1>(m.codes, m.s16, m.x, m.y, m.post, m.fuse_mode, g.K, m.N, 1, 8 * wg_idx, 0, blockIdx.y, g.splits); break;
+        case 4: mv_v2_body<4, 1>(m.codes, m.s16, m.x, m.y, m.post, m.fuse_mode, g.K, m.N, 1, 8 * wg_idx, 0, blockIdx.y, g.splits); break;
+        case 5: mv_v2_body<5, 1>(m.codes, m.s16, m.x, m.y, m.post, m.fuse_mode, g.K, m.N, 1, 8 * wg_idx, 0, blockIdx.y, g.splits); break;
+        default: mv_v2_body<6, 1>(m.codes, m.s16, m.x, m.y, m.post, m.fuse_mode, g.K, m.N, 1, 8 * wg_idx, 0, blockIdx.y, g.splits); break;
+    }
+}
+
+// Batched Split-K reduction for input groups.
+struct splitk_group_args {
+    const float * partials[TRELLIS_GROUP_MAX];
+    const float * post[TRELLIS_GROUP_MAX];
+    float * dst[TRELLIS_GROUP_MAX];
+    int N[TRELLIS_GROUP_MAX];
+    int fuse_mode[TRELLIS_GROUP_MAX];
+    int cta0[TRELLIS_GROUP_MAX + 1];
+    int n;
+    int splits;
+};
+
+static __global__ void __launch_bounds__(128) k_splitk_reduce_group(splitk_group_args g) {
+    int mi = 0;
+#pragma unroll
+    for (int i = 1; i < TRELLIS_GROUP_MAX; ++i) {
+        if (i < g.n && (int) blockIdx.x >= g.cta0[i]) { mi = i; }
+    }
+    const int blk = (int) blockIdx.x - g.cta0[mi];
+    const int N = g.N[mi];
+    const int row = blk * 128 + threadIdx.x;
+    float acc = 0.0f;
+    if (row < N) {
+        const float * p = g.partials[mi];
+        for (int s = 0; s < g.splits; ++s) {
+            acc += p[(int64_t) s * N + row];
         }
+    }
+    if (g.fuse_mode[mi] == 2) {
+        __shared__ float sm[128];
+        sm[threadIdx.x] = acc;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            const int lane = threadIdx.x;
+            const int row_base = blk * 128;
+            float v[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                v[e] = sm[lane + 32 * e];
+            }
+            hadamard_128_warp(v, lane);
+            const float * post = g.post[mi];
+            float * dst = g.dst[mi];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int i = lane + 32 * e;
+                dst[row_base + i] = v[e] * H128_SCALE * post[row_base + i];
+            }
+        }
+        return;
+    }
+    if (row < N) {
+        g.dst[mi][row] = g.fuse_mode[mi] == 1 ? (acc * g.post[mi][row]) : acc;
     }
 }
 
@@ -639,41 +1366,185 @@ static __device__ __forceinline__ void mm_load_ab(ggml_cuda_mma::tile<16, 8, hal
     mm_load_ab_s<8, dl>(t, p, lane);
 }
 
-// 128 rows x 128 tokens workgroup (2x4 wave grid, 8 waves = 256 threads).
-// Each wave computes 4x2 tiles of 16x16: every B (activation) LDS load is reused across 4 M-tiles,
-// and 4 independent accumulators d[0..3] hide WMMA pipeline latency.
-// sx row stride is padded to 12 half2 (48B = 12 banks) to cut LDS bank conflicts; total LDS = 32 KiB (2 WGs/CU).
+// XOR-swizzled load for 16x8 half2 LDS tiles: j0 ^ (((i >> 2) & 1) << 2) removes 4-way bank conflicts.
+template <ggml_cuda_mma::data_layout dl>
+static __device__ __forceinline__ void mm_load_ab_swz(ggml_cuda_mma::tile<16, 8, half2, dl> & t,
+                                                      const half2 * __restrict__ p, int lane) {
+    const int i = lane & 15;
+#if defined(AMD_WMMA_256B_AVAILABLE)
+    const int swz = ((i >> 2) & 1) << 2;
+    *reinterpret_cast<int4 *>(t.x + 0) = *reinterpret_cast<const int4 *>(p + i * 8 + (0 ^ swz));
+    *reinterpret_cast<int4 *>(t.x + 4) = *reinterpret_cast<const int4 *>(p + i * 8 + (4 ^ swz));
+#else
+    const int j0 = (4 * (lane >> 4)) ^ (((i >> 2) & 1) << 2);
+    *reinterpret_cast<int4 *>(t.x) = *reinterpret_cast<const int4 *>(p + i * 8 + j0);
+#endif
+}
+
+static __device__ __forceinline__ int wmma_c_row(int lane, int l) {
+#if defined(AMD_WMMA_256B_AVAILABLE)
+    return 2 * l + (lane >> 4);
+#else
+    return 8 * (lane >> 4) + l;
+#endif
+}
+
+// Prologue for FP16 hi/lo WMMA: precomputes (x * s16) split into (hi, lo) half2 pairs once per token.
+// Layout: x_hilo[(col * kt + kt_idx) * 16 + (0..7: hi, 8..15: lo)] (64 bytes per token per k-tile).
+static __global__ void __launch_bounds__(256) k_prep_act_hilo(
+        const float * __restrict__ x, const half * __restrict__ s16,
+        half2 * __restrict__ x_hilo, int K, int batch) {
+    const int kt = K >> 4;
+    const int64_t total_vec = (int64_t) batch * kt * 4;
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_vec) {
+        return;
+    }
+    const int q   = (int) (idx & 3);          // 0..3 (4 float4s per k-tile)
+    const int64_t tk = idx >> 2;
+    const int kti = (int) (tk % kt);
+    const int col = (int) (tk / kt);
+    const float s = __half2float(s16[kti]);
+    const float4 fv = *reinterpret_cast<const float4 *>(x + (int64_t) col * K + (kti << 4) + (q << 2));
+    const float f0 = fv.x * s, f1 = fv.y * s, f2 = fv.z * s, f3 = fv.w * s;
+    const half2 hi01 = __floats2half2_rn(f0, f1);
+    const half2 hi23 = __floats2half2_rn(f2, f3);
+    const float2 hf01 = __half22float2(hi01);
+    const float2 hf23 = __half22float2(hi23);
+    const half2 lo01 = __floats2half2_rn(f0 - hf01.x, f1 - hf01.y);
+    const half2 lo23 = __floats2half2_rn(f2 - hf23.x, f3 - hf23.y);
+    half2 * dst = x_hilo + tk * 16;
+    dst[q * 2 + 0]     = hi01;
+    dst[q * 2 + 1]     = hi23;
+    dst[8 + q * 2 + 0] = lo01;
+    dst[8 + q * 2 + 1] = lo23;
+}
+
+// Coalesced LDS-transposed epilogue for 128x128 WMMA kernels.
+// Processes 32 tokens at a time through sm_out[32][128 + 1] (16.125 KiB), writing coalesced stores along N
+// and optionally fusing post (fuse_mode==1) or had128+post (fuse_mode==2).
+static __device__ __forceinline__ void mm_128x128_epilogue(
+        float (&acc)[4][2][8], float (*sm_out)[129], float * __restrict__ y,
+        const float * __restrict__ post, int fuse_mode,
+        int N, int batch, int tile_base, int col0, int wave, int lane, int wm, int wn) {
+    const int row_base = 16 * tile_base;
+    const int m0 = 4 * wm;
+    // 4 passes of 32 tokens: pass p covers N-waves wn_lo = 2*(p/2)..+1, tn = p%2 (each pass = 2 N-waves x 16 tokens)
+#pragma unroll
+    for (int pass = 0; pass < 4; ++pass) {
+        const int target_tn = pass & 1;
+        const int wn_base   = (pass >> 1) * 2; // 0 or 2
+        if (wn == wn_base || wn == wn_base + 1) {
+            const int tok32 = (wn - wn_base) * 16 + (lane & 15);
+#pragma unroll
+            for (int tm = 0; tm < 4; ++tm) {
+                const int r_off = (m0 + tm) * 16;
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    sm_out[tok32][r_off + wmma_c_row(lane, l)] = acc[tm][target_tn][l];
+                }
+            }
+        }
+        __syncthreads();
+
+        // 8 waves handle 32 tokens (4 tokens per wave), 32 lanes x 4 elements = 128 rows
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int tok32 = wave * 4 + t;
+            const int wn_t  = wn_base + (tok32 >> 4);
+            const int ccol  = col0 + (2 * wn_t + target_tn) * 16 + (tok32 & 15);
+            if (ccol < batch) {
+                float v[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    v[e] = sm_out[tok32][lane + 32 * e];
+                }
+                if (fuse_mode == 2) {
+                    hadamard_128_warp(v, lane);
+                    float * yrow = y + (int64_t) ccol * N + row_base;
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const int i = lane + 32 * e;
+                        yrow[i] = v[e] * H128_SCALE * post[row_base + i];
+                    }
+                } else {
+                    float * yrow = y + (int64_t) ccol * N + row_base;
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const int i = lane + 32 * e;
+                        if (row_base + i < N) {
+                            yrow[i] = fuse_mode == 1 ? (v[e] * post[row_base + i]) : v[e];
+                        }
+                    }
+                }
+            }
+        }
+        if (pass < 3) {
+            __syncthreads();
+        }
+    }
+}
+
+// 128 rows x 128 tokens workgroup (2x4 wave grid, 8 waves = 256 threads) using precomputed (hi, lo) half2 activations.
+// XOR-swizzled 16x8 half2 tiles eliminate LDS bank conflicts; total LDS = 24 KiB (2 WGs/CU).
+// Prefetches next k-group activations in VGPRs to overlap global loads with WMMA compute.
 template <int BITS, int KG>
 static __global__ void __launch_bounds__(256, 2) k_product_mm_128x128(
-        const uint32_t * __restrict__ codes, const half * __restrict__ s16,
-        const float * __restrict__ x, float * __restrict__ y, int K, int N, int batch) {
+        const uint32_t * __restrict__ codes, const half2 * __restrict__ x_hilo,
+        float * __restrict__ y, const float * __restrict__ post, int fuse_mode,
+        int K, int N, int batch) {
     constexpr int NW = 8 * BITS;
-    constexpr int SX_STRIDE = 12;
     constexpr ggml_cuda_mma::data_layout layout = ggml_cuda_mma::get_input_data_layout();
 
-    __shared__ __align__(16) half2 sw[8][KG][16 * 8];              // A tiles: 8 m-tiles, k-tile (8 KiB for KG=2)
-    __shared__ __align__(16) half2 sx[KG][8][2][16 * SX_STRIDE];   // B tiles: k-tile, 8 sub-tiles, hi/lo (24 KiB for KG=2)
+    union shared_mem_t {
+        struct {
+            __align__(16) half2 sw[8][KG][16 * 8];
+            __align__(16) half2 sx[KG][8][2][16 * 8];
+        } mm;
+        float ep[32][129];
+    };
+    __shared__ shared_mem_t sm;
 
-    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int wm   = wave / 4, wn = wave % 4;               // 2 M-waves x 4 N-waves
+    const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    const int wm   = wave >> 2, wn = wave & 3;
     const int tile_base = 8 * blockIdx.x;
     const int col0 = 128 * blockIdx.y;
-    const int kt   = K / 16;
+    const int kt   = K >> 4;
 
-    // Weight decode: 8 waves cover the 8 M-tiles (1 M-tile per wave, all KG k-tiles)
     const int decode_tile = tile_base + wave;
     const bool decode_live = 16 * decode_tile < N;
     const uint32_t * decode_tiles = codes + (int64_t) decode_tile * kt * NW;
 
     const int m0 = 4 * wm;
-
-    const int c2 = lane % 4;
-    const int r  = lane / 4;
+    const int c2 = lane & 3;
+    const int r  = lane >> 2;
+    const int swz_r = ((r >> 2) & 1) << 2;
     const anchor_plan<BITS> plan = anchor_plan<BITS>::make(lane);
 
-    const int t0  = threadIdx.x / 4;        // 0..63
-    const int kp  = (threadIdx.x % 4) * 4;  // 0, 4, 8, 12 (float index)
-    const int kp2 = (threadIdx.x % 4) * 2;  // 0, 2, 4, 6 (half2 index)
+    // 128 tokens x 2 halves (4 half2 each = int4) = 256 threads -> 1 int4 load for hi + 1 int4 load for lo per k-tile
+    const int tok = threadIdx.x >> 1;
+    const int half_k = (threadIdx.x & 1) * 4;
+    const int sub_s = tok >> 4;
+    const int tr_s  = tok & 15;
+    const int j0_swz = half_k ^ (((tr_s >> 2) & 1) << 2);
+    const int col_s = col0 + tok;
+    const bool tok_live = col_s < batch;
+
+    int4 cur_hi[KG], cur_lo[KG];
+    {
+        const int jn0 = min(KG, kt);
+#pragma unroll
+        for (int j = 0; j < KG; ++j) {
+            cur_hi[j] = make_int4(0, 0, 0, 0);
+            cur_lo[j] = make_int4(0, 0, 0, 0);
+            if (j < jn0 && tok_live) {
+                const half2 * src = x_hilo + ((int64_t) col_s * kt + j) * 16;
+                cur_hi[j] = *reinterpret_cast<const int4 *>(src + half_k);
+                cur_lo[j] = *reinterpret_cast<const int4 *>(src + 8 + half_k);
+            }
+        }
+    }
 
     float acc[4][2][8] = {};
 
@@ -683,42 +1554,39 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_128x128(
 #pragma unroll
             for (int j = 0; j < KG; ++j) {
                 if (j >= jn) { break; }
-                half2 * w2 = sw[wave][j];
+                half2 * w2 = sm.mm.sw[wave][j];
                 float v[8];
                 decode8_plan<BITS>(decode_tiles + (int64_t) (kb0 + j) * NW, plan, v);
-                w2[r * 8 + c2 + 0]       = __floats2half2_rn(v[0], v[1]);
-                w2[r * 8 + c2 + 4]       = __floats2half2_rn(v[2], v[3]);
-                w2[(r + 8) * 8 + c2 + 0] = __floats2half2_rn(v[4], v[5]);
-                w2[(r + 8) * 8 + c2 + 4] = __floats2half2_rn(v[6], v[7]);
+                w2[r * 8 + (c2 ^ swz_r)]             = __floats2half2_rn(v[0], v[1]);
+                w2[r * 8 + ((c2 + 4) ^ swz_r)]       = __floats2half2_rn(v[2], v[3]);
+                w2[(r + 8) * 8 + (c2 ^ swz_r)]       = __floats2half2_rn(v[4], v[5]);
+                w2[(r + 8) * 8 + ((c2 + 4) ^ swz_r)] = __floats2half2_rn(v[6], v[7]);
             }
         }
 #pragma unroll
         for (int j = 0; j < KG; ++j) {
             if (j >= jn) { break; }
-            const float s = __half2float(s16[kb0 + j]);
-#pragma unroll
-            for (int p = 0; p < 2; ++p) {
-                const int tok = p * 64 + t0;
-                const int sub = tok >> 4;
-                const int tr  = tok & 15;
-                const int col = col0 + tok;
-                const float4 fv = col < batch
-                    ? *reinterpret_cast<const float4 *>(x + (int64_t) col * K + 16 * (kb0 + j) + kp)
-                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                const float f0 = fv.x * s, f1 = fv.y * s, f2 = fv.z * s, f3 = fv.w * s;
-                const half2 hi01 = __floats2half2_rn(f0, f1);
-                const half2 hi23 = __floats2half2_rn(f2, f3);
-                const float2 hf01 = __half22float2(hi01);
-                const float2 hf23 = __half22float2(hi23);
-                half2 * hi = sx[j][sub][0];
-                half2 * lo = sx[j][sub][1];
-                hi[tr * SX_STRIDE + kp2 + 0] = hi01;
-                hi[tr * SX_STRIDE + kp2 + 1] = hi23;
-                lo[tr * SX_STRIDE + kp2 + 0] = __floats2half2_rn(f0 - hf01.x, f1 - hf01.y);
-                lo[tr * SX_STRIDE + kp2 + 1] = __floats2half2_rn(f2 - hf23.x, f3 - hf23.y);
-            }
+            *reinterpret_cast<int4 *>(sm.mm.sx[j][sub_s][0] + tr_s * 8 + j0_swz) = cur_hi[j];
+            *reinterpret_cast<int4 *>(sm.mm.sx[j][sub_s][1] + tr_s * 8 + j0_swz) = cur_lo[j];
         }
         __syncthreads();
+
+        // Prefetch next k-group activations into VGPRs before WMMA
+        int4 next_hi[KG], next_lo[KG];
+        const int next_kb0 = kb0 + KG;
+        if (next_kb0 < kt) {
+            const int next_jn = min(KG, kt - next_kb0);
+#pragma unroll
+            for (int j = 0; j < KG; ++j) {
+                next_hi[j] = make_int4(0, 0, 0, 0);
+                next_lo[j] = make_int4(0, 0, 0, 0);
+                if (j < next_jn && tok_live) {
+                    const half2 * src = x_hilo + ((int64_t) col_s * kt + (next_kb0 + j)) * 16;
+                    next_hi[j] = *reinterpret_cast<const int4 *>(src + half_k);
+                    next_lo[j] = *reinterpret_cast<const int4 *>(src + 8 + half_k);
+                }
+            }
+        }
 
         ggml_cuda_mma::tile<16, 8, half2, layout> a[4][KG];
 #pragma unroll
@@ -726,7 +1594,7 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_128x128(
             if (j >= jn) { break; }
 #pragma unroll
             for (int tm = 0; tm < 4; ++tm) {
-                mm_load_ab_s<8, layout>(a[tm][j], sw[m0 + tm][j], lane);
+                mm_load_ab_swz<layout>(a[tm][j], sm.mm.sw[m0 + tm][j], lane);
             }
         }
 #pragma unroll
@@ -744,8 +1612,8 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_128x128(
             for (int j = 0; j < KG; ++j) {
                 if (j >= jn) { break; }
                 ggml_cuda_mma::tile<16, 8, half2, layout> b_hi, b_lo;
-                mm_load_ab_s<SX_STRIDE, layout>(b_hi, sx[j][sub][0], lane);
-                mm_load_ab_s<SX_STRIDE, layout>(b_lo, sx[j][sub][1], lane);
+                mm_load_ab_swz<layout>(b_hi, sm.mm.sx[j][sub][0], lane);
+                mm_load_ab_swz<layout>(b_lo, sm.mm.sx[j][sub][1], lane);
 #pragma unroll
                 for (int tm = 0; tm < 4; ++tm) {
                     ggml_cuda_mma::mma(d[tm], a[tm][j], b_hi);
@@ -763,26 +1631,17 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_128x128(
                 }
             }
         }
+        if (next_kb0 < kt) {
+#pragma unroll
+            for (int j = 0; j < KG; ++j) {
+                cur_hi[j] = next_hi[j];
+                cur_lo[j] = next_lo[j];
+            }
+        }
         __syncthreads();
     }
 
-#pragma unroll
-    for (int tm = 0; tm < 4; ++tm) {
-        const int row_base = 16 * (tile_base + m0 + tm);
-        if (row_base < N) {
-            const int crow = row_base + 8 * (lane / 16);
-#pragma unroll
-            for (int tn = 0; tn < 2; ++tn) {
-                const int ccol = col0 + (2 * wn + tn) * 16 + (lane & 15);
-                if (ccol < batch) {
-#pragma unroll
-                    for (int l = 0; l < 8; ++l) {
-                        y[(int64_t) ccol * N + crow + l] = acc[tm][tn][l];
-                    }
-                }
-            }
-        }
-    }
+    mm_128x128_epilogue(acc, sm.ep, y, post, fuse_mode, N, batch, tile_base, col0, wave, lane, wm, wn);
 }
 
 // 64 rows x 128 tokens workgroup (4x2 wave grid, 8 waves = 256 threads) for small N (< 128).
@@ -806,6 +1665,7 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_64x128(
 
     const int c2 = lane % 4;
     const int r  = lane / 4;
+    const int swz_r = ((r >> 2) & 1) << 2;
     const anchor_plan<BITS> plan = anchor_plan<BITS>::make(lane);
 
     const int t0  = threadIdx.x / 4;        // 0..63
@@ -824,10 +1684,10 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_64x128(
                 half2 * w2 = sw[wm][j];
                 float v[8];
                 decode8_plan<BITS>(tiles + (int64_t) (kb0 + j) * NW, plan, v);
-                w2[r * 8 + c2 + 0]       = __floats2half2_rn(v[0], v[1]);
-                w2[r * 8 + c2 + 4]       = __floats2half2_rn(v[2], v[3]);
-                w2[(r + 8) * 8 + c2 + 0] = __floats2half2_rn(v[4], v[5]);
-                w2[(r + 8) * 8 + c2 + 4] = __floats2half2_rn(v[6], v[7]);
+                w2[r * 8 + (c2 ^ swz_r)]             = __floats2half2_rn(v[0], v[1]);
+                w2[r * 8 + ((c2 + 4) ^ swz_r)]       = __floats2half2_rn(v[2], v[3]);
+                w2[(r + 8) * 8 + (c2 ^ swz_r)]       = __floats2half2_rn(v[4], v[5]);
+                w2[(r + 8) * 8 + ((c2 + 4) ^ swz_r)] = __floats2half2_rn(v[6], v[7]);
             }
         }
 #pragma unroll
@@ -839,6 +1699,7 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_64x128(
                 const int tok = p * 64 + t0;
                 const int sub = tok >> 4;
                 const int tr  = tok & 15;
+                const int kp2_swz = kp2 ^ (((tr >> 2) & 1) << 2);
                 const int col = col0 + tok;
                 const float4 fv = col < batch
                     ? *reinterpret_cast<const float4 *>(x + (int64_t) col * K + 16 * (kb0 + j) + kp)
@@ -850,10 +1711,10 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_64x128(
                 const float2 hf23 = __half22float2(hi23);
                 half2 * hi = sx[j][sub][0];
                 half2 * lo = sx[j][sub][1];
-                hi[tr * 8 + kp2 + 0] = hi01;
-                hi[tr * 8 + kp2 + 1] = hi23;
-                lo[tr * 8 + kp2 + 0] = __floats2half2_rn(f0 - hf01.x, f1 - hf01.y);
-                lo[tr * 8 + kp2 + 1] = __floats2half2_rn(f2 - hf23.x, f3 - hf23.y);
+                hi[tr * 8 + kp2_swz + 0] = hi01;
+                hi[tr * 8 + kp2_swz + 1] = hi23;
+                lo[tr * 8 + kp2_swz + 0] = __floats2half2_rn(f0 - hf01.x, f1 - hf01.y);
+                lo[tr * 8 + kp2_swz + 1] = __floats2half2_rn(f2 - hf23.x, f3 - hf23.y);
             }
         }
         __syncthreads();
@@ -863,7 +1724,7 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_64x128(
 #pragma unroll
             for (int j = 0; j < KG; ++j) {
                 if (j >= jn) { break; }
-                mm_load_ab<layout>(a[j], sw[wm][j], lane);
+                mm_load_ab_swz<layout>(a[j], sw[wm][j], lane);
             }
 #pragma unroll
             for (int tn = 0; tn < 4; ++tn) {
@@ -877,8 +1738,8 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_64x128(
                 for (int j = 0; j < KG; ++j) {
                     if (j >= jn) { break; }
                     ggml_cuda_mma::tile<16, 8, half2, layout> b_hi, b_lo;
-                    mm_load_ab<layout>(b_hi, sx[j][sub][0], lane);
-                    mm_load_ab<layout>(b_lo, sx[j][sub][1], lane);
+                    mm_load_ab_swz<layout>(b_hi, sx[j][sub][0], lane);
+                    mm_load_ab_swz<layout>(b_lo, sx[j][sub][1], lane);
                     ggml_cuda_mma::mma(d, a[j], b_hi);
                     ggml_cuda_mma::mma(d, a[j], b_lo);
                 }
@@ -895,137 +1756,138 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_64x128(
         return;
     }
 
-    const int crow = row0 + 8 * (lane / 16);
 #pragma unroll
     for (int tn = 0; tn < 4; ++tn) {
         const int ccol = col0 + (4 * wn + tn) * 16 + (lane & 15);
         if (ccol < batch) {
 #pragma unroll
             for (int l = 0; l < 8; ++l) {
-                y[(int64_t) ccol * N + crow + l] = acc[tn][l];
+                y[(int64_t) ccol * N + row0 + wmma_c_row(lane, l)] = acc[tn][l];
             }
         }
     }
 }
 
-// Prefill on matrix cores. A workgroup is 4 waves covering 64 output rows x (16*NSUB) tokens. Each wave
-// decodes its own 16x16 weight tile with the scalar decode8 into LDS as exact integers, once per k-tile and
-// reused across the NSUB token sub-tiles (the decode is the dominant cost, so amortizing it matters). s16 is
-// folded into the activations, which are loaded as coalesced float2 and split into an f16 hi/lo pair so the
-// tensor cores keep fp32-level accuracy.
-//
-// KG k-tiles are processed per iteration: their tiles are decoded/staged together behind one barrier and
-// the WMMA accumulator chains across them, then the group is flushed into an fp32 round-to-nearest register
-// accumulator. Chaining is safe for small KG: the gfx12 accumulator feedback bias is ~-1.5e-8*kt^2, so a
-// group of 2-4 contributes ~1e-7 (negligible), while flushing every group keeps the cross-group sum unbiased
-// (the Hadamard output side would otherwise amplify any uniform bias by sqrt(N)). Grouping cuts the barrier
-// and loop overhead ~KG-fold versus one-tile-per-iteration.
-template <int BITS, int KG, int NSUB>
-static __global__ void __launch_bounds__(128) k_product_mm(
+// 128 rows x 32 tokens workgroup (4x2 wave grid, 8 waves = 256 threads) for small batches (9..31).
+// Total LDS = 12 KiB (sw: 8 KiB, sx: 4 KiB) with XOR swizzle for 0 bank conflicts.
+template <int BITS, int KG>
+static __global__ void __launch_bounds__(256, 2) k_product_mm_128x32(
         const uint32_t * __restrict__ codes, const half * __restrict__ s16,
         const float * __restrict__ x, float * __restrict__ y, int K, int N, int batch) {
-    constexpr int NW  = 8 * BITS;
-    constexpr int TOK = 16 * NSUB;  // tokens per workgroup; the weight decode is amortized over NSUB sub-tiles
+    constexpr int NW = 8 * BITS;
     constexpr ggml_cuda_mma::data_layout layout = ggml_cuda_mma::get_input_data_layout();
 
-    __shared__ __align__(16) half sw[4][KG][16 * 16];        // A tiles: wave, k-tile, elem
-    __shared__ __align__(16) half sx[KG][NSUB][2][16 * 16];  // B tiles: k-tile, token sub-tile, hi/lo, elem
+    __shared__ __align__(16) half2 sw[8][KG][16 * 8];
+    __shared__ __align__(16) half2 sx[KG][2][2][16 * 8];
 
-    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int tile  = 4 * blockIdx.x + wave;          // this wave's 16-row tile
-    const int row0  = 16 * tile;
-    const int col0  = TOK * blockIdx.y;
-    const int kt    = K / 16;
-    const bool live = row0 < N;
+    const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    const int wm   = wave >> 1, wn = wave & 1; // 4 M-waves (2 M-tiles each) x 2 N-waves (1 N-subtile each)
+    const int tile_base = 8 * blockIdx.x;
+    const int col0 = 32 * blockIdx.y;
+    const int kt   = K / 16;
 
-    // lane == ring position, so one wave decodes a whole 16x16 tile: rows a/4 and a/4 + 8, columns
-    // c, c + 1, c + 8, c + 9 with c = 2 * (lane % 4)
-    const int c = 2 * (lane % 4);
-    const int r = lane / 4;
+    const int decode_tile = tile_base + wave;
+    const bool decode_live = 16 * decode_tile < N;
+    const uint32_t * decode_tiles = codes + (int64_t) decode_tile * kt * NW;
 
-    ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d;
-    float acc[NSUB][8] = {};
+    const int m0 = 2 * wm;
+    const int c2 = lane & 3;
+    const int r  = lane >> 2;
+    const int swz_r = ((r >> 2) & 1) << 2;
+    const anchor_plan<BITS> plan = anchor_plan<BITS>::make(lane);
 
-    const uint32_t * tiles = codes + (int64_t) tile * kt * NW;
+    // 32 tokens x 4 float4s = 128 items -> first 128 threads stage activations
+    const int tok = threadIdx.x >> 2;          // 0..31 (for tid < 128)
+    const int kp  = (threadIdx.x & 3) * 4;
+    const int kp2 = (threadIdx.x & 3) * 2;
+    const int sub_s = tok >> 4;
+    const int tr_s  = tok & 15;
+    const int kp2_swz = kp2 ^ (((tr_s >> 2) & 1) << 2);
+
+    float acc[2][8] = {};
+
     for (int kb0 = 0; kb0 < kt; kb0 += KG) {
         const int jn = min(KG, kt - kb0);
-        // write phase: decode the group's weight tiles ONCE (reused across all NSUB token sub-tiles)
-        if (live) {
+        if (decode_live) {
 #pragma unroll
             for (int j = 0; j < KG; ++j) {
                 if (j >= jn) { break; }
-                half * w = sw[wave][j];
+                half2 * w2 = sw[wave][j];
                 float v[8];
-                decode8<BITS>(tiles + (int64_t) (kb0 + j) * NW, lane, v);
-                w[r * 16 + c + 0] = __float2half(v[0]);
-                w[r * 16 + c + 1] = __float2half(v[1]);
-                w[r * 16 + c + 8] = __float2half(v[2]);
-                w[r * 16 + c + 9] = __float2half(v[3]);
-                w[(r + 8) * 16 + c + 0] = __float2half(v[4]);
-                w[(r + 8) * 16 + c + 1] = __float2half(v[5]);
-                w[(r + 8) * 16 + c + 8] = __float2half(v[6]);
-                w[(r + 8) * 16 + c + 9] = __float2half(v[7]);
+                decode8_plan<BITS>(decode_tiles + (int64_t) (kb0 + j) * NW, plan, v);
+                w2[r * 8 + (c2 ^ swz_r)]               = __floats2half2_rn(v[0], v[1]);
+                w2[r * 8 + ((c2 + 4) ^ swz_r)]         = __floats2half2_rn(v[2], v[3]);
+                w2[(r + 8) * 8 + (c2 ^ swz_r)]         = __floats2half2_rn(v[4], v[5]);
+                w2[(r + 8) * 8 + ((c2 + 4) ^ swz_r)]   = __floats2half2_rn(v[6], v[7]);
             }
         }
-        // stage activations for every token sub-tile: one coalesced float2 per thread per sub-tile
-        const int t  = threadIdx.x / 8;
-        const int kp = (threadIdx.x % 8) * 2;
+        if (threadIdx.x < 128) {
 #pragma unroll
-        for (int j = 0; j < KG; ++j) {
-            if (j >= jn) { break; }
-            const float s = __half2float(s16[kb0 + j]);
-#pragma unroll
-            for (int sub = 0; sub < NSUB; ++sub) {
-                const int col = col0 + sub * 16 + t;
-                const float2 fv = col < batch
-                    ? *reinterpret_cast<const float2 *>(x + (int64_t) col * K + 16 * (kb0 + j) + kp)
-                    : make_float2(0.0f, 0.0f);
-                const float f0 = fv.x * s, f1 = fv.y * s;
-                const half hi0 = __float2half(f0), hi1 = __float2half(f1);
-                half * hi = sx[j][sub][0]; half * lo = sx[j][sub][1];
-                hi[t * 16 + kp]     = hi0;
-                hi[t * 16 + kp + 1] = hi1;
-                lo[t * 16 + kp]     = __float2half(f0 - __half2float(hi0));
-                lo[t * 16 + kp + 1] = __float2half(f1 - __half2float(hi1));
+            for (int j = 0; j < KG; ++j) {
+                if (j >= jn) { break; }
+                const float s = __half2float(s16[kb0 + j]);
+                const int col = col0 + tok;
+                const float4 fv = col < batch
+                    ? *reinterpret_cast<const float4 *>(x + (int64_t) col * K + 16 * (kb0 + j) + kp)
+                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                const float f0 = fv.x * s, f1 = fv.y * s, f2 = fv.z * s, f3 = fv.w * s;
+                const half2 hi01 = __floats2half2_rn(f0, f1);
+                const half2 hi23 = __floats2half2_rn(f2, f3);
+                const float2 hf01 = __half22float2(hi01);
+                const float2 hf23 = __half22float2(hi23);
+                half2 * hi = sx[j][sub_s][0];
+                half2 * lo = sx[j][sub_s][1];
+                hi[tr_s * 8 + kp2_swz + 0] = hi01;
+                hi[tr_s * 8 + kp2_swz + 1] = hi23;
+                lo[tr_s * 8 + kp2_swz + 0] = __floats2half2_rn(f0 - hf01.x, f1 - hf01.y);
+                lo[tr_s * 8 + kp2_swz + 1] = __floats2half2_rn(f2 - hf23.x, f3 - hf23.y);
             }
         }
         __syncthreads();
 
-        // compute phase: per sub-tile, chain the WMMA accumulator across the group's tiles, then flush
-        if (live) {
+        ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d[2];
 #pragma unroll
-            for (int sub = 0; sub < NSUB; ++sub) {
+        for (int tm = 0; tm < 2; ++tm) {
 #pragma unroll
-                for (int l = 0; l < d.ne; ++l) { d.x[l] = 0.0f; }
-#pragma unroll
-                for (int j = 0; j < KG; ++j) {
-                    if (j >= jn) { break; }
-                    ggml_cuda_mma::tile<16, 8, half2, layout> a, b_hi, b_lo;
-                    mm_load_ab<layout>(a,    (const half2 *) sw[wave][j],      lane);
-                    mm_load_ab<layout>(b_hi, (const half2 *) sx[j][sub][0],    lane);
-                    mm_load_ab<layout>(b_lo, (const half2 *) sx[j][sub][1],    lane);
-                    ggml_cuda_mma::mma(d, a, b_hi);
-                    ggml_cuda_mma::mma(d, a, b_lo);
-                }
-#pragma unroll
-                for (int l = 0; l < d.ne; ++l) { acc[sub][l] += d.x[l]; }
+            for (int l = 0; l < 8; ++l) {
+                d[tm].x[l] = 0.0f;
             }
         }
-        __syncthreads();  // group reads done before the next write phase reuses sw/sx
+#pragma unroll
+        for (int j = 0; j < KG; ++j) {
+            if (j >= jn) { break; }
+            ggml_cuda_mma::tile<16, 8, half2, layout> b_hi, b_lo;
+            mm_load_ab_swz<layout>(b_hi, sx[j][wn][0], lane);
+            mm_load_ab_swz<layout>(b_lo, sx[j][wn][1], lane);
+#pragma unroll
+            for (int tm = 0; tm < 2; ++tm) {
+                ggml_cuda_mma::tile<16, 8, half2, layout> a;
+                mm_load_ab_swz<layout>(a, sw[m0 + tm][j], lane);
+                ggml_cuda_mma::mma(d[tm], a, b_hi);
+                ggml_cuda_mma::mma(d[tm], a, b_lo);
+            }
+        }
+#pragma unroll
+        for (int tm = 0; tm < 2; ++tm) {
+#pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                acc[tm][l] += d[tm].x[l];
+            }
+        }
+        __syncthreads();
     }
 
-    if (!live) {
-        return;
-    }
-
-    const int crow = row0 + 8 * (lane / 16);
+    const int ccol = col0 + wn * 16 + (lane & 15);
+    if (ccol < batch) {
 #pragma unroll
-    for (int sub = 0; sub < NSUB; ++sub) {
-        const int ccol = col0 + sub * 16 + lane % 16;   // C row -> token within the sub-tile
-        if (ccol < batch) {
+        for (int tm = 0; tm < 2; ++tm) {
+            const int row_base = 16 * (tile_base + m0 + tm);
+            if (row_base < N) {
 #pragma unroll
-            for (int l = 0; l < d.ne; ++l) {
-                y[(int64_t) ccol * N + crow + l] = acc[sub][l];
+                for (int l = 0; l < 8; ++l) {
+                    y[(int64_t) ccol * N + row_base + wmma_c_row(lane, l)] = acc[tm][l];
+                }
             }
         }
     }
@@ -1033,65 +1895,285 @@ static __global__ void __launch_bounds__(128) k_product_mm(
 
 // ---- host orchestration --------------------------------------------------------------------------------
 
-static void launch_side(side_args a, float *& data, float *& tmp, int batch, bool inverse, cudaStream_t stream) {
-    if (a.len <= 1) {
-        return;
-    }
-    // small blockwise side: the whole block in one workgroup's LDS
-    if (a.nparts == 0 && a.m == 1 && a.len <= BLOCK_LDS_MAX && a.len * (int) sizeof(float) <= 64 * 1024) {
-        a.scale = (float) std::pow((double) a.len, -0.5);
-        if (a.len >= 128) {
-            const size_t smem = a.len > 128 ? (size_t) a.len * sizeof(float) : 0;
-            k_output_block_fast<<<dim3(a.n / a.len, batch, 1), a.len / 4, smem, stream>>>(
-                a.n, a.len, a.scale, 0, data, nullptr, data);
-        } else {
-            const int threads = std::min(a.len / 2, 256);
-            const dim3 grid(a.n / a.len, batch, 1);
-            k_block<<<grid, std::max(threads, 1), a.len * sizeof(float), stream>>>(a, data);
-        }
-        return;
-    }
-    const dim3 block(256, 1, 1);
-    auto cross = [&]() {
-        if (a.m == 1) {
-            return;
-        }
-        a.scale = (float) std::pow((double) a.m, -0.5);
-        const dim3 grid((a.len + 255) / 256, a.shards, batch);
-        k_cross<<<grid, block, 0, stream>>>(a, data, tmp);
-        std::swap(data, tmp);
-    };
-    if (inverse) {
-        cross();
-    }
-    for (a.h = 1; a.h < a.run; a.h *= 2) {
-        a.scale = a.h == a.run / 2 ? (float) std::pow((double) a.run, -0.5) : 1.0f;
-        const dim3 grid((a.len / 2 + 255) / 256, a.shards, batch);
-        k_butterfly<<<grid, block, 0, stream>>>(a, data);
-    }
-    if (!inverse) {
-        cross();
+static void launch_input_rht(int K, int blk, int first, int batch, const ggml_tensor * x,
+                             const float * pre, const int32_t * pin, float * dst, cudaStream_t stream) {
+    const float sc = (float) std::pow((double) blk, -0.5);
+    const dim3 grid(K / blk, batch, 1);
+    const int ne1 = (int) x->ne[1], ne2 = (int) x->ne[2];
+    const size_t nb1 = x->nb[1], nb2 = x->nb[2], nb3 = x->nb[3];
+    const char * xd = (const char *) x->data;
+    switch (blk) {
+        case 128:  k_input_rht_128<<<grid, 32, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, pre, pin, dst); break;
+        case 256:  k_input_rht<256, 256><<<grid, 256, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, pre, pin, dst); break;
+        case 512:  k_input_rht<512, 256><<<grid, 256, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, pre, pin, dst); break;
+        case 1024: k_input_rht<1024, 256><<<grid, 256, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, pre, pin, dst); break;
+        case 2048: k_input_rht<2048, 1024><<<grid, 1024, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, pre, pin, dst); break;
+        case 4096: k_input_rht<4096, 1024><<<grid, 1024, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, pre, pin, dst); break;
+        default:   GGML_ABORT("trellis hip: bad rht block %d", blk);
     }
 }
 
-// one side of the op: kind 0 identity, kind 1 blockwise, kind 2 whole-slice
-static void side(float *& data, float *& tmp, int n, int batch, int kind, int block, int shards,
-                 const int32_t * parts, int nparts, bool inverse, cudaStream_t stream) {
-    if (kind == 0) {
+static void launch_output_rht(int N, int blk, int first, int batch, const float * src,
+                              const float * post, float * dst, cudaStream_t stream) {
+    const float sc = (float) std::pow((double) blk, -0.5);
+    const dim3 grid(N / blk, batch, 1);
+    switch (blk) {
+        case 128:  k_output_rht_128<<<grid, 32, 0, stream>>>(N, sc, first, src, post, dst); break;
+        case 256:  k_output_rht<256, 256><<<grid, 256, 0, stream>>>(N, sc, first, src, post, dst); break;
+        case 512:  k_output_rht<512, 256><<<grid, 256, 0, stream>>>(N, sc, first, src, post, dst); break;
+        case 1024: k_output_rht<1024, 256><<<grid, 256, 0, stream>>>(N, sc, first, src, post, dst); break;
+        case 2048: k_output_rht<2048, 1024><<<grid, 1024, 0, stream>>>(N, sc, first, src, post, dst); break;
+        case 4096: k_output_rht<4096, 1024><<<grid, 1024, 0, stream>>>(N, sc, first, src, post, dst); break;
+        default:   GGML_ABORT("trellis hip: bad rht block %d", blk);
+    }
+}
+
+static void launch_swiglu_rht(int N, int blk, int batch, const float * g, const float * u, float * xd,
+                              const float * post_g, const float * post_u, const float * pre_d, cudaStream_t stream) {
+    const float sc = (float) std::pow((double) blk, -0.5);
+    const dim3 grid(N / blk, batch, 1);
+    switch (blk) {
+        case 128:  k_swiglu_rht_128<<<grid, 32, 0, stream>>>(g, u, xd, N, sc, post_g, post_u, pre_d); break;
+        case 256:  k_swiglu_rht<256, 256><<<grid, 256, 0, stream>>>(g, u, xd, N, sc, post_g, post_u, pre_d); break;
+        case 512:  k_swiglu_rht<512, 256><<<grid, 256, 0, stream>>>(g, u, xd, N, sc, post_g, post_u, pre_d); break;
+        case 1024: k_swiglu_rht<1024, 256><<<grid, 256, 0, stream>>>(g, u, xd, N, sc, post_g, post_u, pre_d); break;
+        case 2048: k_swiglu_rht<2048, 1024><<<grid, 1024, 0, stream>>>(g, u, xd, N, sc, post_g, post_u, pre_d); break;
+        case 4096: k_swiglu_rht<4096, 1024><<<grid, 1024, 0, stream>>>(g, u, xd, N, sc, post_g, post_u, pre_d); break;
+        default:   GGML_ABORT("trellis hip: bad swiglu rht block %d", blk);
+    }
+}
+
+static void launch_input_group_rht(int K, int blk, int first, int batch, const ggml_tensor * x,
+                                   const group_in_args & g, cudaStream_t stream) {
+    const float sc = (float) std::pow((double) blk, -0.5);
+    const dim3 grid(K / blk, batch, 1);
+    const int ne1 = (int) x->ne[1], ne2 = (int) x->ne[2];
+    const size_t nb1 = x->nb[1], nb2 = x->nb[2], nb3 = x->nb[3];
+    const char * xd = (const char *) x->data;
+    switch (blk) {
+        case 128:  k_input_group_rht_128<<<grid, 32, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, g); break;
+        case 256:  k_input_group_rht<256, 256><<<grid, 256, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, g); break;
+        case 512:  k_input_group_rht<512, 256><<<grid, 256, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, g); break;
+        case 1024: k_input_group_rht<1024, 256><<<grid, 256, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, g); break;
+        case 2048: k_input_group_rht<2048, 1024><<<grid, 1024, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, g); break;
+        case 4096: k_input_group_rht<4096, 1024><<<grid, 1024, 0, stream>>>(K, sc, first, ne1, ne2, nb1, nb2, nb3, xd, g); break;
+        default:   GGML_ABORT("trellis hip: bad group rht block %d", blk);
+    }
+}
+
+static void launch_output_group_rht(int blk, int batch, const group_out_args & g, cudaStream_t stream) {
+    const float sc = (float) std::pow((double) blk, -0.5);
+    const dim3 grid(g.cta0[g.n], batch, 1);
+    switch (blk) {
+        case 128:  k_output_group_rht_128<<<grid, 32, 0, stream>>>(g, sc); break;
+        case 256:  k_output_group_rht<256, 256><<<grid, 256, 0, stream>>>(g, sc); break;
+        case 512:  k_output_group_rht<512, 256><<<grid, 256, 0, stream>>>(g, sc); break;
+        case 1024: k_output_group_rht<1024, 256><<<grid, 256, 0, stream>>>(g, sc); break;
+        case 2048: k_output_group_rht<2048, 1024><<<grid, 1024, 0, stream>>>(g, sc); break;
+        case 4096: k_output_group_rht<4096, 1024><<<grid, 1024, 0, stream>>>(g, sc); break;
+        default:   GGML_ABORT("trellis hip: bad group rht block %d", blk);
+    }
+}
+
+static void launch_hf_runs(int n, int shards, int len, int run, float c_run, const hf_parts & p,
+                           int batch, int first_dst, const float * src, const float * post, float * dst,
+                           cudaStream_t stream) {
+    if (run <= 128) {
+        auto go = [&](auto E_tag) {
+            constexpr int E = decltype(E_tag)::value;
+            const int64_t items = (int64_t) batch * shards * ((len + 32 * E - 1) / (32 * E));
+            k_hf_runs_warp<E><<<dim3((unsigned) ((items + 7) / 8), 1, 1), 256, 0, stream>>>(
+                n, batch, shards, len, run, c_run, p, first_dst, src, post, dst);
+        };
+        if (run <= 32) { go(std::integral_constant<int, 1>{}); }
+        else if (run == 64) { go(std::integral_constant<int, 2>{}); }
+        else { go(std::integral_constant<int, 4>{}); }
+    } else {
+        const int threads = std::min(run / 2, 512);
+        k_hf_runs_cta<<<dim3(len / run, shards, batch), std::max(threads, 32), (size_t) run * sizeof(float), stream>>>(
+            n, run, c_run, p, first_dst, src, post, dst);
+    }
+}
+
+// Prepare input for one op: fuses gather + pre + input side where possible.
+static void prepare_input(const op_t & o, int first, int batch, float * in, cudaStream_t stream) {
+    const int K = o.K;
+    const float * pre = (const float *) o.pre->data;
+    const int32_t * pin = o.pin ? (const int32_t *) o.pin->data : nullptr;
+
+    if (o.cols_kind == 1 && o.cols_block >= 128 && o.cols_block <= BLOCK_LDS_MAX) {
+        launch_input_rht(K, o.cols_block, first, batch, o.x, pre, pin, in, stream);
         return;
     }
-    side_args a = {};
-    a.n       = n;
-    a.len     = kind == 1 ? block : n / shards;
-    a.shards  = kind == 1 ? n / block : shards;
-    a.m       = kind == 1 ? 1 : ggml_trellis_hadfull_m(a.len);
-    a.run     = a.len / a.m;
-    a.inverse = inverse;
-    a.nparts  = kind == 2 ? nparts : 0;
-    for (int i = 0; i < a.nparts; ++i) {
-        a.parts[i] = parts[i];
+    if (o.cols_kind == 2) {
+        const int len = K / o.cols_shards;
+        const int m = ggml_trellis_hadfull_m(len);
+        const int run = len / m;
+        const float c_run = (float) std::pow((double) run, -0.5);
+        const float c_m = (float) std::pow((double) m, -0.5);
+        const hf_parts p = make_hf_parts(K, o.cols_shards, nullptr, 0);
+        if (len <= 12288) {
+            const int threads = len >= 4096 ? 512 : 256;
+            k_hf_lds_fwd<<<dim3(o.cols_shards, batch, 1), threads, (size_t) len * sizeof(float), stream>>>(
+                K, len, run, m, c_run, c_m, p, first, (int) o.x->ne[1], (int) o.x->ne[2],
+                o.x->nb[1], o.x->nb[2], o.x->nb[3], (const char *) o.x->data, pre, pin, in);
+            return;
+        }
+        k_input<<<dim3((K + 255) / 256, batch, 1), 256, 0, stream>>>(
+            K, first, (int) o.x->ne[1], (int) o.x->ne[2], o.x->nb[1], o.x->nb[2], o.x->nb[3],
+            (const char *) o.x->data, pre, pin, in);
+        launch_hf_runs(K, o.cols_shards, len, run, c_run, p, batch, 0, in, nullptr, in, stream);
+        if (m > 1) {
+            const int g = m >= 68 ? 8 : (m >= 20 ? 16 : 32);
+            const int ncol = std::min(run, g);
+            const int threads = std::min(((m * ncol + 31) / 32) * 32, 1024);
+            k_hf_cross<<<dim3((run + g - 1) / g, o.cols_shards, batch), threads, 0, stream>>>(
+                K, m, run, g, c_m, 0, p, in, in);
+        }
+        return;
     }
-    launch_side(a, data, tmp, batch, inverse, stream);
+
+    // kind == 0, or kind == 1 with block < 128 or block > 4096
+    k_input<<<dim3((K + 255) / 256, batch, 1), 256, 0, stream>>>(
+        K, first, (int) o.x->ne[1], (int) o.x->ne[2], o.x->nb[1], o.x->nb[2], o.x->nb[3],
+        (const char *) o.x->data, pre, pin, in);
+    if (o.cols_kind == 1 && o.cols_block > 1) {
+        const float sc = (float) std::pow((double) o.cols_block, -0.5);
+        if (o.cols_block == 16 || o.cols_block == 32) {
+            const int64_t items = (int64_t) batch * ((K + 31) / 32);
+            k_block_warp<1><<<dim3((unsigned) ((items + 7) / 8), 1, 1), 256, 0, stream>>>(
+                K, batch, o.cols_block, sc, 0, in, nullptr, in);
+        } else if (o.cols_block == 64) {
+            const int64_t items = (int64_t) batch * ((K + 63) / 64);
+            k_block_warp<2><<<dim3((unsigned) ((items + 7) / 8), 1, 1), 256, 0, stream>>>(
+                K, batch, o.cols_block, sc, 0, in, nullptr, in);
+        } else {
+            const int threads = std::max(std::min(o.cols_block / 2, 512), 1);
+            k_block<<<dim3(K / o.cols_block, batch, 1), threads, (size_t) o.cols_block * sizeof(float), stream>>>(
+                K, o.cols_block, sc, in);
+        }
+    }
+}
+
+// Finish output for one op: fuses output side + post even when pout != nullptr (then gathers if gather=true).
+static void finish_output(const op_t & o, int first, int batch, float * out, float * dst, bool gather,
+                          cudaStream_t stream) {
+    const int N = o.N;
+    const float * post = (const float *) o.post->data;
+    const int32_t * pout = o.pout ? (const int32_t *) o.pout->data : nullptr;
+    float * side_dst = pout ? out : dst;
+    const int side_first = pout ? 0 : first;
+
+    if (o.rows_kind == 1 && o.rows_block >= 128 && o.rows_block <= BLOCK_LDS_MAX) {
+        launch_output_rht(N, o.rows_block, side_first, batch, out, post, side_dst, stream);
+        if (pout && gather) {
+            k_output<<<dim3((N + 255) / 256, batch, 1), 256, 0, stream>>>(N, first, out, nullptr, pout, dst);
+        }
+        return;
+    }
+    if (o.rows_kind == 2) {
+        const int len = N / o.rows_shards;
+        const int m = ggml_trellis_hadfull_m(len);
+        const int run = len / m;
+        const float c_run = (float) std::pow((double) run, -0.5);
+        const float c_m = (float) std::pow((double) m, -0.5);
+        const hf_parts p = make_hf_parts(N, o.rows_shards, o.parts, o.nparts);
+        if ((m == 1 && len <= 12288) || (m > 1 && len <= 6144)) {
+            const int threads = len >= 4096 ? 512 : 256;
+            const size_t smem = (size_t) (m > 1 ? 2 * len : len) * sizeof(float);
+            k_hf_lds_inv<<<dim3(o.rows_shards, batch, 1), threads, smem, stream>>>(
+                N, len, run, m, c_run, c_m, p, side_first, out, post, side_dst);
+        } else {
+            if (m > 1) {
+                const int g = m >= 68 ? 8 : (m >= 20 ? 16 : 32);
+                const int ncol = std::min(run, g);
+                const int threads = std::min(((m * ncol + 31) / 32) * 32, 1024);
+                k_hf_cross<<<dim3((run + g - 1) / g, o.rows_shards, batch), threads, 0, stream>>>(
+                    N, m, run, g, c_m, 1, p, out, out);
+            }
+            launch_hf_runs(N, o.rows_shards, len, run, c_run, p, batch, side_first, out, post, side_dst, stream);
+        }
+        if (pout && gather) {
+            k_output<<<dim3((N + 255) / 256, batch, 1), 256, 0, stream>>>(N, first, out, nullptr, pout, dst);
+        }
+        return;
+    }
+    if (o.rows_kind == 1 && o.rows_block > 1) {
+        const float sc = (float) std::pow((double) o.rows_block, -0.5);
+        if (o.rows_block == 16 || o.rows_block == 32) {
+            const int64_t items = (int64_t) batch * ((N + 31) / 32);
+            k_block_warp<1><<<dim3((unsigned) ((items + 7) / 8), 1, 1), 256, 0, stream>>>(
+                N, batch, o.rows_block, sc, side_first, out, post, side_dst);
+            if (pout && gather) {
+                k_output<<<dim3((N + 255) / 256, batch, 1), 256, 0, stream>>>(N, first, out, nullptr, pout, dst);
+            }
+            return;
+        }
+        if (o.rows_block == 64) {
+            const int64_t items = (int64_t) batch * ((N + 63) / 64);
+            k_block_warp<2><<<dim3((unsigned) ((items + 7) / 8), 1, 1), 256, 0, stream>>>(
+                N, batch, o.rows_block, sc, side_first, out, post, side_dst);
+            if (pout && gather) {
+                k_output<<<dim3((N + 255) / 256, batch, 1), 256, 0, stream>>>(N, first, out, nullptr, pout, dst);
+            }
+            return;
+        }
+        const int threads = std::max(std::min(o.rows_block / 2, 512), 1);
+        k_block<<<dim3(N / o.rows_block, batch, 1), threads, (size_t) o.rows_block * sizeof(float), stream>>>(
+            N, o.rows_block, sc, out);
+    }
+    // kind == 0, or kind == 1 fallback (block < 16 or > 4096)
+    if (pout && !gather) {
+        k_output<<<dim3((N + 255) / 256, batch, 1), 256, 0, stream>>>(N, 0, out, post, nullptr, out);
+    } else {
+        k_output<<<dim3((N + 255) / 256, batch, 1), 256, 0, stream>>>(N, first, out, post, pout, dst);
+    }
+}
+
+static inline int mv1_fuse_mode(const op_t & o) {
+    if (o.pout != nullptr) {
+        return 0;
+    }
+    if (o.rows_kind == 0) {
+        return 1;
+    }
+    if (o.rows_kind == 1 && o.rows_block == 128) {
+        return 2;
+    }
+    return 0;
+}
+
+static inline int choose_mv1_splits(int total_wgs, int K) {
+    const int kt = K >> 4;
+    if (total_wgs >= 128 || kt < 32) {
+        return 1;
+    }
+    int splits = (128 + total_wgs - 1) / total_wgs;
+    splits = std::min(splits, kt / 16);
+    splits = std::min(splits, 16);
+    return std::max(splits, 1);
+}
+
+static void launch_mv1_group(const mv1_group_args & g, cudaStream_t stream) {
+    bool mixed = false;
+    const int bits0 = g.m[0].bits;
+    for (int i = 1; i < g.n; ++i) {
+        if (g.m[i].bits != bits0) { mixed = true; }
+    }
+    const dim3 grid(g.cta0[g.n], g.splits, 1);
+    if (mixed) {
+        k_product_mv1_mixed_group<<<grid, 256, 0, stream>>>(g);
+        return;
+    }
+    switch (bits0) {
+        case 1: k_product_mv1_group<1><<<grid, 256, 0, stream>>>(g); break;
+        case 2: k_product_mv1_group<2><<<grid, 256, 0, stream>>>(g); break;
+        case 3: k_product_mv1_group<3><<<grid, 256, 0, stream>>>(g); break;
+        case 4: k_product_mv1_group<4><<<grid, 256, 0, stream>>>(g); break;
+        case 5: k_product_mv1_group<5><<<grid, 256, 0, stream>>>(g); break;
+        case 6: k_product_mv1_group<6><<<grid, 256, 0, stream>>>(g); break;
+        default: GGML_ABORT("trellis hip: bad bit width %d", bits0);
+    }
 }
 
 // Prefill/batch path on matrix cores (Plan 2 Q1). On by default for RDNA4; set GGML_TRELLIS_HIP_MM=0
@@ -1104,73 +2186,55 @@ static bool hip_mm_enabled() {
     return on;
 }
 
-// k-tiles per flush group (BK = 16*KG). Tunable for experiments; 2 is the default.
-static int hip_mm_kg() {
-    static const int g = [] {
-        const char * s = getenv("GGML_TRELLIS_HIP_MM_KG");
-        int v = s != nullptr ? atoi(s) : 2;
-        return v >= 4 ? 4 : 2;
-    }();
-    return g;
+static inline bool hip_wmma_supported(int cc) {
+    return GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc) ||
+           GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc);
 }
 
-// token sub-tiles per workgroup (TOK = 16*NSUB): amortizes the weight decode. Tunable; default 2.
-static int hip_mm_nsub() {
-    static const int n = [] {
-        const char * s = getenv("GGML_TRELLIS_HIP_MM_NSUB");
-        int v = s != nullptr ? atoi(s) : 2;
-        return v >= 4 ? 4 : (v >= 2 ? 2 : 1);
-    }();
-    return n;
+template <int BITS>
+static void launch_mm_128x128(ggml_cuda_pool & pool, const uint32_t * codes, const half * s16,
+                              const float * in, float * out, const float * post, int fuse_mode,
+                              int K, int N, int batch, cudaStream_t stream) {
+    const dim3 grid((N / 16 + 7) / 8, (batch + 127) / 128, 1);
+    const int kt = K >> 4;
+    ggml_cuda_pool_alloc<float> act_buf(pool, (size_t) batch * K);
+    half2 * x_hilo = reinterpret_cast<half2 *>(act_buf.ptr);
+    const int64_t total_vec = (int64_t) batch * kt * 4;
+    k_prep_act_hilo<<<(int) ((total_vec + 255) / 256), 256, 0, stream>>>(in, s16, x_hilo, K, batch);
+    k_product_mm_128x128<BITS, 2><<<grid, 256, 0, stream>>>(codes, x_hilo, out, post, fuse_mode, K, N, batch);
 }
 
-#define TRELLIS_HIP_MM_LAUNCH(BITS, KG, NSUB)                                                              \
-    k_product_mm<BITS, KG, NSUB><<<dim3((N / 16 + 3) / 4, (batch + 16 * (NSUB) - 1) / (16 * (NSUB)), 1),    \
-        128, 0, stream>>>(codes, s16, in, out, K, N, batch)
-
-#define TRELLIS_HIP_MMDispatch(BITS)                                                                       \
-    do {                                                                                                   \
-        if (batch >= 32 && N >= 128) {                                                                     \
-            const dim3 grid((N / 16 + 7) / 8, (batch + 127) / 128, 1);                                     \
-            k_product_mm_128x128<BITS, 2><<<grid, 256, 0, stream>>>(codes, s16, in, out, K, N, batch);     \
-        } else if (batch >= 32) {                                                                          \
-            const dim3 grid((N / 16 + 3) / 4, (batch + 127) / 128, 1);                                     \
-            k_product_mm_64x128<BITS, 2><<<grid, 256, 0, stream>>>(codes, s16, in, out, K, N, batch);      \
-        } else {                                                                                           \
-            const int ns = batch >= 16 * hip_mm_nsub() ? hip_mm_nsub() : 1;                                \
-            if (hip_mm_kg() == 4) {                                                                        \
-                switch (ns) {                                                                              \
-                    case 4: TRELLIS_HIP_MM_LAUNCH(BITS, 4, 4); break;                                      \
-                    case 2: TRELLIS_HIP_MM_LAUNCH(BITS, 4, 2); break;                                      \
-                    default: TRELLIS_HIP_MM_LAUNCH(BITS, 4, 1); break;                                     \
-                }                                                                                          \
-            } else {                                                                                       \
-                switch (ns) {                                                                              \
-                    case 4: TRELLIS_HIP_MM_LAUNCH(BITS, 2, 4); break;                                      \
-                    case 2: TRELLIS_HIP_MM_LAUNCH(BITS, 2, 2); break;                                      \
-                    default: TRELLIS_HIP_MM_LAUNCH(BITS, 2, 1); break;                                     \
-                }                                                                                          \
-            }                                                                                              \
-        }                                                                                                  \
-    } while (0)
-
-#define TRELLIS_HIP_PRODUCT(BITS, COLS)                                                                    \
-    k_product<BITS, COLS><<<dim3(N / 4, (batch + (COLS) - 1) / (COLS), 1), 128, 0, stream>>>(              \
-        codes, s16, in, out, K, N, batch)
+#define TRELLIS_HIP_MV_LAUNCH(BITS, COLS)                                                                  \
+    k_product_mv_v2<BITS, COLS><<<dim3((N + 127) / 128, (batch + (COLS) - 1) / (COLS), 1), 256, 0, stream>>>( \
+        codes, s16, in, out, nullptr, 0, K, N, batch, 1)
 
 #define TRELLIS_HIP_CASE(BITS)                                                                             \
     case BITS:                                                                                             \
         if (batch == 1) {                                                                                  \
-            k_product_mv<BITS, 1><<<dim3(N / 16, 1, 1), 128, 0, stream>>>(codes, s16, in, out, K, N, 1);    \
-        } else if (wmma && N % 16 == 0 && hip_mm_enabled()) {                                              \
-            TRELLIS_HIP_MMDispatch(BITS);                                                                  \
+            k_product_mv_v2<BITS, 1><<<dim3((N + 127) / 128, splits, 1), 256, 0, stream>>>(                \
+                codes, s16, in, out, post, fuse_mode, K, N, 1, splits);                                    \
+        } else if (wmma && batch >= 9 && N % 16 == 0 && hip_mm_enabled()) {                                \
+            if (batch >= 32 && N >= 128) {                                                                 \
+                launch_mm_128x128<BITS>(pool, codes, s16, in, out, post, fuse_mode, K, N, batch, stream);  \
+            } else if (batch >= 32) {                                                                      \
+                const dim3 grid((N / 16 + 3) / 4, (batch + 127) / 128, 1);                                 \
+                k_product_mm_64x128<BITS, 2><<<grid, 256, 0, stream>>>(codes, s16, in, out, K, N, batch);  \
+            } else {                                                                                       \
+                const dim3 grid((N / 16 + 7) / 8, (batch + 31) / 32, 1);                                   \
+                k_product_mm_128x32<BITS, 2><<<grid, 256, 0, stream>>>(codes, s16, in, out, K, N, batch);  \
+            }                                                                                              \
+        } else if (batch <= 2) {                                                                           \
+            TRELLIS_HIP_MV_LAUNCH(BITS, 2);                                                                \
+        } else if (batch <= 4) {                                                                           \
+            TRELLIS_HIP_MV_LAUNCH(BITS, 4);                                                                \
         } else {                                                                                           \
-            k_product_mv<BITS, 8><<<dim3(N / 16, (batch + 7) / 8, 1), 128, 0, stream>>>(                    \
-                codes, s16, in, out, K, N, batch);                                                         \
+            TRELLIS_HIP_MV_LAUNCH(BITS, 8);                                                                \
         }                                                                                                  \
         break
 
-static void product(const op_t & o, const float * in, float * out, int batch, bool wmma, cudaStream_t stream) {
+static void product(ggml_cuda_pool & pool, const op_t & o, const float * in, float * out, int batch,
+                    bool wmma, cudaStream_t stream,
+                    const float * post = nullptr, int fuse_mode = 0, int splits = 1) {
     const int K = o.K, N = o.N;
     const uint32_t * codes = (const uint32_t *) o.w->data;
     const half * s16 = (const half *) o.s16->data;
@@ -1186,7 +2250,7 @@ static void product(const op_t & o, const float * in, float * out, int batch, bo
 }
 
 #undef TRELLIS_HIP_CASE
-#undef TRELLIS_HIP_PRODUCT
+#undef TRELLIS_HIP_MV_LAUNCH
 
 } // namespace trellis_hip
 
@@ -1254,75 +2318,282 @@ void ggml_cuda_op_trellis(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int K = o.K, N = o.N;
     cudaStream_t stream = ctx.stream();
 
+    if (o.T == 1) {
+        const int fmode = mv1_fuse_mode(o);
+        const int splits = choose_mv1_splits((N + 127) / 128, K);
+        const size_t n_in  = (size_t) K;
+        const size_t n_out = splits > 1 ? (size_t) splits * N : (fmode > 0 ? 0 : (size_t) N);
+        ggml_cuda_pool_alloc<float> scratch(ctx.pool(), n_in + n_out);
+        float * const in  = scratch.ptr;
+        float * const out = in + n_in;
+
+        prepare_input(o, 0, 1, in, stream);
+        if (splits > 1) {
+            product(ctx.pool(), o, in, out, 1, false, stream, nullptr, 0, splits);
+            float * red_dst = fmode > 0 ? (float *) dst->data : out;
+            k_splitk_reduce<<<(N + 127) / 128, 128, 0, stream>>>(
+                out, (const float *) o.post->data, red_dst, N, splits, fmode);
+            if (fmode == 0) {
+                finish_output(o, 0, 1, out, (float *) dst->data, true, stream);
+            }
+        } else if (fmode > 0) {
+            product(ctx.pool(), o, in, (float *) dst->data, 1, false, stream, (const float *) o.post->data, fmode, 1);
+        } else {
+            product(ctx.pool(), o, in, out, 1, false, stream);
+            finish_output(o, 0, 1, out, (float *) dst->data, true, stream);
+        }
+        return;
+    }
+
     const int64_t capacity = std::min<int64_t>(o.T, BATCH);
-    const bool need_in_tmp  = o.cols_kind == 2 && ggml_trellis_hadfull_m(K / o.cols_shards) > 1;
-    const bool need_out_tmp = o.rows_kind == 2 && ggml_trellis_hadfull_m(N / o.rows_shards) > 1;
-    const size_t n_in  = (size_t) (need_in_tmp  ? 2 : 1) * capacity * K;
-    const size_t n_out = (size_t) (need_out_tmp ? 2 : 1) * capacity * N;
+    const size_t n_in  = (size_t) capacity * K;
+    const size_t n_out = (size_t) capacity * N;
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(), n_in + n_out);
-    float * const base = scratch.ptr;
+    float * const in  = scratch.ptr;
+    float * const out = in + n_in;
 
-    // matrix-core prefill only where the gfx12 WMMA tiles are validated
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    const bool wmma = GGML_CUDA_CC_IS_RDNA4_M(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
-
-    const bool fuse_in = o.cols_kind == 1 && o.cols_block >= 128 && o.cols_block <= BLOCK_LDS_MAX;
-    const bool fuse_out = o.rows_kind == 1 && o.rows_block >= 128 && o.rows_block <= BLOCK_LDS_MAX && o.pout == nullptr;
+    const bool wmma = hip_wmma_supported(cc);
 
     for (int64_t first = 0; first < o.T; first += BATCH) {
         const int batch = (int) std::min<int64_t>(o.T - first, BATCH);
-        float * in      = base;
-        float * in_tmp  = need_in_tmp ? base + capacity * K : nullptr;
-        float * out     = base + n_in;
-        float * out_tmp = need_out_tmp ? out + capacity * N : nullptr;
-
-        float * din = in;  float * din_tmp = in_tmp;
-        if (fuse_in) {
-            const float sc = (float) std::pow((double) o.cols_block, -0.5);
-            const size_t smem = o.cols_block > 128 ? (size_t) o.cols_block * sizeof(float) : 0;
-            k_input_block_fast<<<dim3(K / o.cols_block, batch, 1), o.cols_block / 4, smem, stream>>>(
-                K, o.cols_block, sc, (int) first, (int) o.x->ne[1], (int) o.x->ne[2], o.x->nb[1], o.x->nb[2], o.x->nb[3],
-                (const char *) o.x->data, (const float *) o.pre->data,
-                o.pin ? (const int32_t *) o.pin->data : nullptr, in);
+        const bool can_fuse_mm = wmma && batch >= 32 && N >= 128 && N % 16 == 0 && hip_mm_enabled();
+        const int fmode = can_fuse_mm ? mv1_fuse_mode(o) : 0;
+        prepare_input(o, (int) first, batch, in, stream);
+        if (fmode > 0) {
+            product(ctx.pool(), o, in, (float *) dst->data + first * N, batch, wmma, stream,
+                    (const float *) o.post->data, fmode, 1);
         } else {
-            const dim3 block(256, 1, 1);
-            k_input<<<dim3((K + 255) / 256, batch, 1), block, 0, stream>>>(
-                K, (int) first, (int) o.x->ne[1], (int) o.x->ne[2], o.x->nb[1], o.x->nb[2], o.x->nb[3],
-                (const char *) o.x->data, (const float *) o.pre->data,
-                o.pin ? (const int32_t *) o.pin->data : nullptr, in);
-            side(din, din_tmp, K, batch, o.cols_kind, o.cols_block, o.cols_shards, nullptr, 0, false, stream);
-        }
-
-        product(o, din, out, batch, wmma, stream);
-
-        if (fuse_out) {
-            const float sc = (float) std::pow((double) o.rows_block, -0.5);
-            const size_t smem = o.rows_block > 128 ? (size_t) o.rows_block * sizeof(float) : 0;
-            k_output_block_fast<<<dim3(N / o.rows_block, batch, 1), o.rows_block / 4, smem, stream>>>(
-                N, o.rows_block, sc, (int) first, out, (const float *) o.post->data, (float *) dst->data);
-        } else {
-            float * dout = out; float * dout_tmp = out_tmp;
-            side(dout, dout_tmp, N, batch, o.rows_kind, o.rows_block, o.rows_shards, o.parts, o.nparts, true, stream);
-            const dim3 block(256, 1, 1);
-            k_output<<<dim3((N + 255) / 256, batch, 1), block, 0, stream>>>(
-                N, (int) first, dout, (const float *) o.post->data,
-                o.pout ? (const int32_t *) o.pout->data : nullptr, (float *) dst->data);
+            product(ctx.pool(), o, in, out, batch, wmma, stream);
+            finish_output(o, (int) first, batch, out, (float *) dst->data, true, stream);
         }
     }
 }
 
-// Plan 1 does not fuse: the group and MLP-chain paths stay on the CUDA side.
+static bool trellis_hip_groupable(const ggml_tensor * t) {
+    if (t->op != GGML_OP_TRELLIS || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_cuda_trellis_supported(t)) {
+        return false;
+    }
+    const trellis_hip::op_t o(t);
+    return o.pin == nullptr;
+}
+
 int ggml_cuda_trellis_group_size(const ggml_cgraph * cgraph, int i) {
-    GGML_UNUSED(cgraph);
-    GGML_UNUSED(i);
-    return 1;
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (!trellis_hip_groupable(a)) {
+        return 1;
+    }
+    int n = 1;
+    while (n < TRELLIS_GROUP_MAX && i + n < cgraph->n_nodes) {
+        const ggml_tensor * b = cgraph->nodes[i + n];
+        if (!trellis_hip_groupable(b) || b->src[1] != a->src[1] || b->src[0]->ne[0] != a->src[0]->ne[0]) {
+            break;
+        }
+        ++n;
+    }
+    return n;
 }
 
 void ggml_cuda_op_trellis_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(nodes);
-    GGML_UNUSED(n);
-    GGML_ABORT("trellis hip: input groups are not implemented");
+    using namespace trellis_hip;
+    GGML_ASSERT(n >= 1 && n <= TRELLIS_GROUP_MAX);
+    cudaStream_t stream = ctx.stream();
+
+    op_t ops[TRELLIS_GROUP_MAX] = {
+        op_t(nodes[0]),
+        op_t(nodes[n > 1 ? 1 : 0]),
+        op_t(nodes[n > 2 ? 2 : 0]),
+        op_t(nodes[n > 3 ? 3 : 0]),
+        op_t(nodes[n > 4 ? 4 : 0]),
+        op_t(nodes[n > 5 ? 5 : 0]),
+        op_t(nodes[n > 6 ? 6 : 0]),
+        op_t(nodes[n > 7 ? 7 : 0]),
+    };
+
+    const int K = ops[0].K;
+    const int64_t T = ops[0].T;
+    const int64_t capacity = std::min<int64_t>(T, BATCH);
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const bool wmma = hip_wmma_supported(cc);
+
+    // Deduplicate input buffers when (cols_kind, cols_block, cols_shards, pre) match
+    int in_slot[TRELLIS_GROUP_MAX];
+    int n_in_slots = 0;
+    for (int i = 0; i < n; ++i) {
+        int found = -1;
+        for (int j = 0; j < i; ++j) {
+            if (ops[i].cols_kind == ops[j].cols_kind &&
+                ops[i].cols_block == ops[j].cols_block &&
+                ops[i].cols_shards == ops[j].cols_shards &&
+                ops[i].pre->data == ops[j].pre->data) {
+                found = in_slot[j];
+                break;
+            }
+        }
+        in_slot[i] = found >= 0 ? found : n_in_slots++;
+    }
+
+    int total_wgs = 0;
+    int fmodes[TRELLIS_GROUP_MAX] = {};
+    for (int i = 0; i < n; ++i) {
+        total_wgs += (ops[i].N + 127) / 128;
+        fmodes[i] = T == 1 ? mv1_fuse_mode(ops[i]) : 0;
+    }
+    const int splits = T == 1 ? choose_mv1_splits(total_wgs, K) : 1;
+
+    size_t total_out = 0;
+    for (int i = 0; i < n; ++i) {
+        if (T == 1 && splits == 1 && fmodes[i] > 0) {
+            continue;
+        }
+        total_out += (size_t) (T == 1 ? splits : capacity) * ops[i].N;
+    }
+    const size_t total_in = (size_t) n_in_slots * capacity * K;
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), total_in + total_out);
+
+    float * in_bufs[TRELLIS_GROUP_MAX];
+    for (int s = 0; s < n_in_slots; ++s) {
+        in_bufs[s] = scratch.ptr + (size_t) s * capacity * K;
+    }
+    float * out_bufs[TRELLIS_GROUP_MAX];
+    float * op_ptr = scratch.ptr + total_in;
+    for (int i = 0; i < n; ++i) {
+        if (T == 1 && splits == 1 && fmodes[i] > 0) {
+            out_bufs[i] = (float *) nodes[i]->data;
+        } else {
+            out_bufs[i] = op_ptr;
+            op_ptr += (size_t) (T == 1 ? splits : capacity) * ops[i].N;
+        }
+    }
+
+    for (int64_t first = 0; first < T; first += BATCH) {
+        const int batch = (int) std::min<int64_t>(T - first, BATCH);
+
+        // 1. Prepare inputs (batch members sharing cols_kind == 1 and same cols_block in [128, 4096])
+        bool slot_done[TRELLIS_GROUP_MAX] = {};
+        for (int i = 0; i < n; ++i) {
+            const int s = in_slot[i];
+            if (slot_done[s]) { continue; }
+            if (ops[i].cols_kind == 1 && ops[i].cols_block >= 128 && ops[i].cols_block <= BLOCK_LDS_MAX) {
+                const int blk = ops[i].cols_block;
+                group_in_args gi = {};
+                for (int j = i; j < n; ++j) {
+                    const int sj = in_slot[j];
+                    if (!slot_done[sj] && ops[j].cols_kind == 1 && ops[j].cols_block == blk) {
+                        gi.pre[gi.n] = (const float *) ops[j].pre->data;
+                        gi.dst[gi.n] = in_bufs[sj];
+                        gi.n++;
+                        slot_done[sj] = true;
+                    }
+                }
+                if (gi.n > 1) {
+                    launch_input_group_rht(K, blk, (int) first, batch, ops[i].x, gi, stream);
+                } else {
+                    launch_input_rht(K, blk, (int) first, batch, ops[i].x, gi.pre[0], nullptr, gi.dst[0], stream);
+                }
+            } else {
+                prepare_input(ops[i], (int) first, batch, in_bufs[s], stream);
+                slot_done[s] = true;
+            }
+        }
+
+        // 2. Product (grouped single launch for batch == 1, with Split-K and fused epilogue)
+        bool out_done[TRELLIS_GROUP_MAX] = {};
+        if (batch == 1) {
+            mv1_group_args g = {};
+            g.n = n;
+            g.K = K;
+            g.splits = splits;
+            for (int i = 0; i < n; ++i) {
+                g.m[i].codes     = (const uint32_t *) ops[i].w->data;
+                g.m[i].s16       = (const half *) ops[i].s16->data;
+                g.m[i].x         = in_bufs[in_slot[i]];
+                g.m[i].y         = out_bufs[i];
+                g.m[i].post      = (splits == 1 && fmodes[i] > 0) ? (const float *) ops[i].post->data : nullptr;
+                g.m[i].fuse_mode = splits == 1 ? fmodes[i] : 0;
+                g.m[i].N         = ops[i].N;
+                g.m[i].bits      = ops[i].bits;
+                g.cta0[i + 1]    = g.cta0[i] + (ops[i].N + 127) / 128;
+                if (splits == 1 && fmodes[i] > 0) {
+                    out_done[i] = true;
+                }
+            }
+            launch_mv1_group(g, stream);
+            if (splits > 1) {
+                splitk_group_args sg = {};
+                sg.n = n;
+                sg.splits = splits;
+                for (int i = 0; i < n; ++i) {
+                    sg.partials[i]  = out_bufs[i];
+                    sg.post[i]      = (const float *) ops[i].post->data;
+                    sg.dst[i]       = fmodes[i] > 0 ? (float *) nodes[i]->data : out_bufs[i];
+                    sg.N[i]         = ops[i].N;
+                    sg.fuse_mode[i] = fmodes[i];
+                    sg.cta0[i + 1]  = sg.cta0[i] + (ops[i].N + 127) / 128;
+                    if (fmodes[i] > 0) {
+                        out_done[i] = true;
+                    }
+                }
+                k_splitk_reduce_group<<<sg.cta0[n], 128, 0, stream>>>(sg);
+            }
+        } else {
+            for (int i = 0; i < n; ++i) {
+                const bool can_fuse_mm = wmma && batch >= 32 && ops[i].N >= 128 && ops[i].N % 16 == 0 && hip_mm_enabled();
+                const int fm = can_fuse_mm ? mv1_fuse_mode(ops[i]) : 0;
+                if (fm > 0) {
+                    product(ctx.pool(), ops[i], in_bufs[in_slot[i]], (float *) nodes[i]->data + first * ops[i].N,
+                            batch, wmma, stream, (const float *) ops[i].post->data, fm, 1);
+                    out_done[i] = true;
+                } else {
+                    product(ctx.pool(), ops[i], in_bufs[in_slot[i]], out_bufs[i], batch, wmma, stream);
+                }
+            }
+        }
+
+        // 3. Output sides (batch members sharing rows_kind == 1 and same rows_block in [128, 4096]) + batched pout gather
+        gather_set gset = {};
+        int nseg = 0, nmax = 0;
+        for (int i = 0; i < n; ++i) {
+            if (out_done[i]) { continue; }
+            if (ops[i].rows_kind == 1 && ops[i].rows_block >= 128 && ops[i].rows_block <= BLOCK_LDS_MAX) {
+                const int blk = ops[i].rows_block;
+                group_out_args go = {};
+                for (int j = i; j < n; ++j) {
+                    if (!out_done[j] && ops[j].rows_kind == 1 && ops[j].rows_block == blk) {
+                        const bool has_pout = ops[j].pout != nullptr;
+                        go.src[go.n]       = out_bufs[j];
+                        go.post[go.n]      = (const float *) ops[j].post->data;
+                        go.dst[go.n]       = has_pout ? out_bufs[j] : (float *) nodes[j]->data;
+                        go.N[go.n]         = ops[j].N;
+                        go.first_dst[go.n] = has_pout ? 0 : (int) first;
+                        go.cta0[go.n + 1]  = go.cta0[go.n] + ops[j].N / blk;
+                        go.n++;
+                        out_done[j] = true;
+                        if (has_pout) {
+                            gset.seg[nseg++] = {out_bufs[j], (const int32_t *) ops[j].pout->data, (float *) nodes[j]->data, ops[j].N};
+                            nmax = std::max(nmax, ops[j].N);
+                        }
+                    }
+                }
+                if (go.n > 1) {
+                    launch_output_group_rht(blk, batch, go, stream);
+                } else {
+                    launch_output_rht(go.N[0], blk, go.first_dst[0], batch, go.src[0], go.post[0], go.dst[0], stream);
+                }
+            } else {
+                finish_output(ops[i], (int) first, batch, out_bufs[i], (float *) nodes[i]->data, false, stream);
+                out_done[i] = true;
+                if (ops[i].pout != nullptr) {
+                    gset.seg[nseg++] = {out_bufs[i], (const int32_t *) ops[i].pout->data, (float *) nodes[i]->data, ops[i].N};
+                    nmax = std::max(nmax, ops[i].N);
+                }
+            }
+        }
+        if (nseg > 0) {
+            const int blocks = std::min((nmax + 255) / 256, 64);
+            k_gather_multi<<<dim3(blocks, batch, nseg), 256, 0, stream>>>(gset, (int) first);
+        }
+    }
 }
 
 // Fuse MLP gate/up output Hadamard + SwiGLU + down input Hadamard into one kernel.
@@ -1352,7 +2623,7 @@ int ggml_cuda_trellis_mlp_chain(const ggml_cgraph * cgraph, int i) {
     }
     const op_t og(gate), ou(up), od(down);
     const int blk = og.rows_block;
-    if (og.T > BATCH || og.x != ou.x || og.K != ou.K ||
+    if (og.x != ou.x || og.K != ou.K ||
         og.rows_kind != 1 || ou.rows_kind != 1 || ou.rows_block != blk || og.pout != nullptr || ou.pout != nullptr ||
         od.cols_kind != 1 || od.cols_block != blk || od.pin != nullptr ||
         blk < 128 || blk > BLOCK_LDS_MAX || (blk & (blk - 1)) != 0 ||
@@ -1376,69 +2647,104 @@ void ggml_cuda_op_trellis_mlp_chain(ggml_backend_cuda_context & ctx, ggml_tensor
     const op_t og(gate), ou(up), od(down);
     cudaStream_t stream = ctx.stream();
 
-    const int batch = (int) og.T;
+    const int64_t capacity = std::min<int64_t>(og.T, BATCH);
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    const bool wmma = GGML_CUDA_CC_IS_RDNA4_M(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
+    const bool wmma = hip_wmma_supported(cc);
 
-    const bool need_g_tmp = og.cols_kind == 2 && ggml_trellis_hadfull_m(og.K / og.cols_shards) > 1;
-    const bool need_u_tmp = ou.cols_kind == 2 && ggml_trellis_hadfull_m(ou.K / ou.cols_shards) > 1;
-    const bool need_d_tmp = od.rows_kind == 2 && ggml_trellis_hadfull_m(od.N / od.rows_shards) > 1;
-    const size_t n_in  = (size_t) ((need_g_tmp || need_u_tmp) ? 2 : 1) * batch * og.K;
-    const size_t n_xd  = (size_t) batch * og.N;
-    const size_t n_out = (size_t) (need_d_tmp ? 2 : 1) * batch * od.N;
-    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), n_in + n_xd + n_out);
-    float * in      = scratch.ptr;
-    float * in_tmp  = (need_g_tmp || need_u_tmp) ? in + (size_t) batch * og.K : nullptr;
-    float * xd      = in + n_in;
-    float * out_d   = xd + n_xd;
-    float * out_tmp = need_d_tmp ? out_d + (size_t) batch * od.N : nullptr;
+    const bool same_in = og.cols_kind == ou.cols_kind && og.cols_block == ou.cols_block &&
+                         og.cols_shards == ou.cols_shards && og.pin == ou.pin &&
+                         og.pre->data == ou.pre->data;
+    const bool group_in_rht = !same_in && og.pin == nullptr && ou.pin == nullptr &&
+                              og.cols_kind == 1 && ou.cols_kind == 1 && og.cols_block == ou.cols_block &&
+                              og.cols_block >= 128 && og.cols_block <= BLOCK_LDS_MAX;
 
-    auto run_input = [&](const op_t & o, float *& din) {
-        din = in;
-        float * din_tmp = in_tmp;
-        if (o.cols_kind == 1 && o.cols_block >= 128 && o.cols_block <= BLOCK_LDS_MAX) {
-            const float sc = (float) std::pow((double) o.cols_block, -0.5);
-            const size_t smem = o.cols_block > 128 ? (size_t) o.cols_block * sizeof(float) : 0;
-            k_input_block_fast<<<dim3(o.K / o.cols_block, batch, 1), o.cols_block / 4, smem, stream>>>(
-                o.K, o.cols_block, sc, 0, (int) o.x->ne[1], (int) o.x->ne[2], o.x->nb[1], o.x->nb[2], o.x->nb[3],
-                (const char *) o.x->data, (const float *) o.pre->data,
-                o.pin ? (const int32_t *) o.pin->data : nullptr, in);
-        } else {
-            k_input<<<dim3((o.K + 255) / 256, batch, 1), dim3(256, 1, 1), 0, stream>>>(
-                o.K, 0, (int) o.x->ne[1], (int) o.x->ne[2], o.x->nb[1], o.x->nb[2], o.x->nb[3],
-                (const char *) o.x->data, (const float *) o.pre->data,
-                o.pin ? (const int32_t *) o.pin->data : nullptr, in);
-            side(din, din_tmp, o.K, batch, o.cols_kind, o.cols_block, o.cols_shards, nullptr, 0, false, stream);
-        }
-    };
+    const int splits_gu = og.T == 1 ? choose_mv1_splits((og.N + 127) / 128 + (ou.N + 127) / 128, og.K) : 1;
+    const int splits_d  = og.T == 1 ? choose_mv1_splits((od.N + 127) / 128, od.K) : 1;
+    const int fmode_d   = og.T == 1 ? mv1_fuse_mode(od) : 0;
 
-    float * din = nullptr;
-    run_input(og, din);
-    product(og, din, (float *) gate->data, batch, wmma, stream);
-
-    run_input(ou, din);
-    product(ou, din, (float *) up->data, batch, wmma, stream);
+    const size_t n_in   = (size_t) (same_in ? 1 : 2) * capacity * og.K;
+    const size_t n_xd   = (size_t) capacity * og.N;
+    const size_t n_pgu  = splits_gu > 1 ? (size_t) 2 * splits_gu * og.N : 0;
+    const size_t n_out  = og.T == 1
+        ? (splits_d > 1 ? (size_t) splits_d * od.N : (fmode_d > 0 ? 0 : (size_t) od.N))
+        : (size_t) capacity * od.N;
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), n_in + n_xd + n_pgu + n_out);
+    float * in_g  = scratch.ptr;
+    float * in_u  = same_in ? in_g : in_g + (size_t) capacity * og.K;
+    float * xd    = scratch.ptr + n_in;
+    float * p_g   = xd + n_xd;
+    float * p_u   = p_g + (size_t) splits_gu * og.N;
+    float * out_d = p_g + n_pgu;
 
     const int blk = og.rows_block;
-    const float sc = (float) std::pow((double) blk, -0.5);
-    const size_t smem = blk > 128 ? (size_t) 2 * blk * sizeof(float) : 0;
-    k_swiglu_block_fast<<<dim3(og.N / blk, batch, 1), blk / 4, smem, stream>>>(
-        (const float *) gate->data, (const float *) up->data, xd, og.N, blk, sc,
-        (const float *) og.post->data, (const float *) ou.post->data, (const float *) od.pre->data);
 
-    product(od, xd, out_d, batch, wmma, stream);
+    for (int64_t first = 0; first < og.T; first += BATCH) {
+        const int batch = (int) std::min<int64_t>(og.T - first, BATCH);
 
-    if (od.rows_kind == 1 && od.rows_block >= 128 && od.rows_block <= BLOCK_LDS_MAX && od.pout == nullptr) {
-        const float dsc = (float) std::pow((double) od.rows_block, -0.5);
-        const size_t dsmem = od.rows_block > 128 ? (size_t) od.rows_block * sizeof(float) : 0;
-        k_output_block_fast<<<dim3(od.N / od.rows_block, batch, 1), od.rows_block / 4, dsmem, stream>>>(
-            od.N, od.rows_block, dsc, 0, out_d, (const float *) od.post->data, (float *) down->data);
-    } else {
-        float * dout = out_d;
-        float * dout_tmp = out_tmp;
-        side(dout, dout_tmp, od.N, batch, od.rows_kind, od.rows_block, od.rows_shards, od.parts, od.nparts, true, stream);
-        k_output<<<dim3((od.N + 255) / 256, batch, 1), dim3(256, 1, 1), 0, stream>>>(
-            od.N, 0, dout, (const float *) od.post->data,
-            od.pout ? (const int32_t *) od.pout->data : nullptr, (float *) down->data);
+        if (same_in) {
+            prepare_input(og, (int) first, batch, in_g, stream);
+        } else if (group_in_rht) {
+            group_in_args gi = {};
+            gi.pre[0] = (const float *) og.pre->data; gi.dst[0] = in_g;
+            gi.pre[1] = (const float *) ou.pre->data; gi.dst[1] = in_u;
+            gi.n = 2;
+            launch_input_group_rht(og.K, og.cols_block, (int) first, batch, og.x, gi, stream);
+        } else {
+            prepare_input(og, (int) first, batch, in_g, stream);
+            prepare_input(ou, (int) first, batch, in_u, stream);
+        }
+
+        if (batch == 1) {
+            mv1_group_args g = {};
+            g.n = 2;
+            g.K = og.K;
+            g.splits = splits_gu;
+            g.m[0] = {(const uint32_t *) og.w->data, (const half *) og.s16->data, in_g, splits_gu > 1 ? p_g : (float *) gate->data, nullptr, 0, og.N, og.bits};
+            g.m[1] = {(const uint32_t *) ou.w->data, (const half *) ou.s16->data, in_u, splits_gu > 1 ? p_u : (float *) up->data,   nullptr, 0, ou.N, ou.bits};
+            g.cta0[1] = (og.N + 127) / 128;
+            g.cta0[2] = g.cta0[1] + (ou.N + 127) / 128;
+            launch_mv1_group(g, stream);
+            if (splits_gu > 1) {
+                splitk_group_args sg = {};
+                sg.n = 2;
+                sg.splits = splits_gu;
+                sg.partials[0] = p_g; sg.dst[0] = (float *) gate->data; sg.N[0] = og.N; sg.cta0[1] = (og.N + 127) / 128;
+                sg.partials[1] = p_u; sg.dst[1] = (float *) up->data;   sg.N[1] = ou.N; sg.cta0[2] = sg.cta0[1] + (ou.N + 127) / 128;
+                k_splitk_reduce_group<<<sg.cta0[2], 128, 0, stream>>>(sg);
+            }
+        } else {
+            product(ctx.pool(), og, in_g, (float *) gate->data, batch, wmma, stream);
+            product(ctx.pool(), ou, in_u, (float *) up->data,   batch, wmma, stream);
+        }
+
+        launch_swiglu_rht(og.N, blk, batch, (const float *) gate->data, (const float *) up->data, xd,
+                          (const float *) og.post->data, (const float *) ou.post->data, (const float *) od.pre->data, stream);
+
+        if (batch == 1) {
+            if (splits_d > 1) {
+                product(ctx.pool(), od, xd, out_d, 1, false, stream, nullptr, 0, splits_d);
+                float * red_dst = fmode_d > 0 ? (float *) down->data : out_d;
+                k_splitk_reduce<<<(od.N + 127) / 128, 128, 0, stream>>>(
+                    out_d, (const float *) od.post->data, red_dst, od.N, splits_d, fmode_d);
+                if (fmode_d == 0) {
+                    finish_output(od, 0, 1, out_d, (float *) down->data, true, stream);
+                }
+            } else if (fmode_d > 0) {
+                product(ctx.pool(), od, xd, (float *) down->data, 1, false, stream, (const float *) od.post->data, fmode_d, 1);
+            } else {
+                product(ctx.pool(), od, xd, out_d, 1, false, stream);
+                finish_output(od, 0, 1, out_d, (float *) down->data, true, stream);
+            }
+        } else {
+            const bool can_fuse_d = wmma && batch >= 32 && od.N >= 128 && od.N % 16 == 0 && hip_mm_enabled();
+            const int fmd = can_fuse_d ? mv1_fuse_mode(od) : 0;
+            if (fmd > 0) {
+                product(ctx.pool(), od, xd, (float *) down->data + first * od.N, batch, wmma, stream,
+                        (const float *) od.post->data, fmd, 1);
+            } else {
+                product(ctx.pool(), od, xd, out_d, batch, wmma, stream);
+                finish_output(od, (int) first, batch, out_d, (float *) down->data, true, stream);
+            }
+        }
     }
 }

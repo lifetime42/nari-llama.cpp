@@ -6367,8 +6367,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
         case GGML_OP_TRELLIS:
-            // trellis fork: libtrellis's GEMV / GEMM need sm_80+ (the loader probes this op for a coded weight)
-            return ggml_cuda_trellis_supported(op) && ggml_cuda_info().devices[dev_ctx->device].cc >= GGML_CUDA_CC_AMPERE;
+            // trellis fork: libtrellis's GEMV / GEMM need sm_80+; HIP kernels require wave32 (RDNA)
+            return ggml_cuda_trellis_supported(op) &&
+                   ggml_cuda_info().devices[dev_ctx->device].cc >= GGML_CUDA_CC_AMPERE &&
+                   ggml_cuda_info().devices[dev_ctx->device].warp_size == 32;
         case GGML_OP_TRELLIS_GET_ROWS:
             return false; // trellis fork: the coded embedding stays in host memory (CPU op)
         case GGML_OP_MUL_MAT:
