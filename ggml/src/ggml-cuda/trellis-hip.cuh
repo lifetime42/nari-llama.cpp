@@ -266,18 +266,12 @@ static __device__ __forceinline__ void rht_row_stages(
     __syncthreads();
 }
 
-// Store one (f0, f1) pair into x_hilo layout: [(col * kt + kti) * 16 + (0..7: hi, 8..15: lo)].
+// Store one (f0, f1) pair into FP16 activation layout: [(col * kt + kti) * 8 + pair] (half2).
 static __device__ __forceinline__ void store_hilo_pair(
-        half2 * __restrict__ x_hilo, int64_t col, int kt, int k_even, float f0, float f1, float s) {
-    const float a0 = f0 * s, a1 = f1 * s;
-    const half2 hi = __floats2half2_rn(a0, a1);
-    const float2 hf = __half22float2(hi);
-    const half2 lo = __floats2half2_rn(a0 - hf.x, a1 - hf.y);
+        half2 * __restrict__ x_f16, int64_t col, int kt, int k_even, float f0, float f1, float s) {
     const int kti = k_even >> 4;
     const int pair = (k_even >> 1) & 7;
-    half2 * dst = x_hilo + (col * kt + kti) * 16;
-    dst[pair]     = hi;
-    dst[8 + pair] = lo;
+    x_f16[(col * kt + kti) * 8 + pair] = __floats2half2_rn(f0 * s, f1 * s);
 }
 
 // Fast blockwise input Hadamard for B = 128 (0 LDS, 0 barriers) and B in {256..4096} (2 barriers).
@@ -1585,11 +1579,11 @@ static __device__ __forceinline__ int wmma_c_row(int lane, int l) {
 #endif
 }
 
-// Prologue for FP16 hi/lo WMMA: precomputes (x * s16) split into (hi, lo) half2 pairs once per token.
-// Layout: x_hilo[(col * kt + kt_idx) * 16 + (0..7: hi, 8..15: lo)] (64 bytes per token per k-tile).
+// Prologue for FP16 WMMA: precomputes (x * s16) as half2 once per token.
+// Layout: x_f16[(col * kt + kt_idx) * 8 + (0..7)] (32 bytes per token per k-tile).
 static __global__ void __launch_bounds__(256) k_prep_act_hilo(
         const float * __restrict__ x, const half * __restrict__ s16,
-        half2 * __restrict__ x_hilo, int K, int batch) {
+        half2 * __restrict__ x_f16, int K, int batch) {
     const int kt = K >> 4;
     const int64_t total_vec = (int64_t) batch * kt * 4;
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1602,18 +1596,9 @@ static __global__ void __launch_bounds__(256) k_prep_act_hilo(
     const int col = (int) (tk / kt);
     const float s = __half2float(s16[kti]);
     const float4 fv = *reinterpret_cast<const float4 *>(x + (int64_t) col * K + (kti << 4) + (q << 2));
-    const float f0 = fv.x * s, f1 = fv.y * s, f2 = fv.z * s, f3 = fv.w * s;
-    const half2 hi01 = __floats2half2_rn(f0, f1);
-    const half2 hi23 = __floats2half2_rn(f2, f3);
-    const float2 hf01 = __half22float2(hi01);
-    const float2 hf23 = __half22float2(hi23);
-    const half2 lo01 = __floats2half2_rn(f0 - hf01.x, f1 - hf01.y);
-    const half2 lo23 = __floats2half2_rn(f2 - hf23.x, f3 - hf23.y);
-    half2 * dst = x_hilo + tk * 16;
-    dst[q * 2 + 0]     = hi01;
-    dst[q * 2 + 1]     = hi23;
-    dst[8 + q * 2 + 0] = lo01;
-    dst[8 + q * 2 + 1] = lo23;
+    half2 * dst = x_f16 + tk * 8;
+    dst[q * 2 + 0] = __floats2half2_rn(fv.x * s, fv.y * s);
+    dst[q * 2 + 1] = __floats2half2_rn(fv.z * s, fv.w * s);
 }
 
 // Coalesced LDS-transposed epilogue for 128x128 WMMA kernels.
@@ -1682,10 +1667,10 @@ static __device__ __forceinline__ void mm_128x128_epilogue(
 }
 
 // Double-buffered 128 rows x 128 tokens workgroup (2x4 wave grid, 8 waves = 256 threads).
-// Uses precomputed (hi, lo) half2 activations, coalesced wave code loads, VGPR prefetch, and A-reuse across tn.
+// Uses precomputed FP16 activations, coalesced wave code loads, VGPR prefetch, and A-reuse across tn.
 template <int BITS, int KG>
-static __global__ void __launch_bounds__(256, 2) k_product_mm_128x128(
-        const uint32_t * __restrict__ codes, const half2 * __restrict__ x_hilo,
+static __global__ void __launch_bounds__(256, 3) k_product_mm_128x128(
+        const uint32_t * __restrict__ codes, const half2 * __restrict__ x_f16,
         float * __restrict__ y, const float * __restrict__ post, int fuse_mode,
         int K, int N, int batch) {
     static_assert(KG == 2, "k_product_mm_128x128 expects KG == 2");
@@ -1696,7 +1681,7 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_128x128(
     union shared_mem_t {
         struct {
             __align__(16) half2 sw[2][8][16 * 8];
-            __align__(16) half2 sx[2][8][2][16 * 8];
+            __align__(16) half2 sx[2][8][16 * 8];
             uint32_t sm_c[8][NW];
         } mm;
         float ep[32][129];
@@ -1728,7 +1713,7 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_128x128(
     const int col_s = col0 + tok;
     const bool tok_live = col_s < batch;
 
-    auto g_load = [&](int kb, uint32_t (&c_reg)[CPL], int4 & hi_v, int4 & lo_v) {
+    auto g_load = [&](int kb, uint32_t (&c_reg)[CPL], int4 & x_v) {
         if (decode_live) {
             const uint32_t * tp = decode_tiles + (int64_t) kb * NW;
 #pragma unroll
@@ -1738,16 +1723,14 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_128x128(
             }
         }
         if (tok_live) {
-            const half2 * src = x_hilo + ((int64_t) col_s * kt + kb) * 16;
-            hi_v = *reinterpret_cast<const int4 *>(src + half_k);
-            lo_v = *reinterpret_cast<const int4 *>(src + 8 + half_k);
+            const half2 * src = x_f16 + ((int64_t) col_s * kt + kb) * 8;
+            x_v = *reinterpret_cast<const int4 *>(src + half_k);
         } else {
-            hi_v = make_int4(0, 0, 0, 0);
-            lo_v = make_int4(0, 0, 0, 0);
+            x_v = make_int4(0, 0, 0, 0);
         }
     };
 
-    auto stage = [&](int buf, const uint32_t (&c_reg)[CPL], const int4 & hi_v, const int4 & lo_v) {
+    auto stage = [&](int buf, const uint32_t (&c_reg)[CPL], const int4 & x_v) {
         if (decode_live) {
 #pragma unroll
             for (int u = 0; u < CPL; ++u) {
@@ -1763,100 +1746,79 @@ static __global__ void __launch_bounds__(256, 2) k_product_mm_128x128(
             w2[(r + 8) * 8 + (c2 ^ swz_r)]       = __floats2half2_rn(v[4], v[5]);
             w2[(r + 8) * 8 + ((c2 + 4) ^ swz_r)] = __floats2half2_rn(v[6], v[7]);
         }
-        *reinterpret_cast<int4 *>(sm.mm.sx[buf][sub_s][0] + tr_s * 8 + j0_swz) = hi_v;
-        *reinterpret_cast<int4 *>(sm.mm.sx[buf][sub_s][1] + tr_s * 8 + j0_swz) = lo_v;
+        *reinterpret_cast<int4 *>(sm.mm.sx[buf][sub_s] + tr_s * 8 + j0_swz) = x_v;
     };
 
     auto mma_step = [&](int buf, ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> (&d)[4][2]) {
-        ggml_cuda_mma::tile<16, 8, half2, layout> b0_hi, b0_lo, b1_hi, b1_lo;
-        mm_load_ab_swz<layout>(b0_hi, sm.mm.sx[buf][2 * wn + 0][0], lane);
-        mm_load_ab_swz<layout>(b0_lo, sm.mm.sx[buf][2 * wn + 0][1], lane);
-        mm_load_ab_swz<layout>(b1_hi, sm.mm.sx[buf][2 * wn + 1][0], lane);
-        mm_load_ab_swz<layout>(b1_lo, sm.mm.sx[buf][2 * wn + 1][1], lane);
+        ggml_cuda_mma::tile<16, 8, half2, layout> b0, b1;
+        mm_load_ab_swz<layout>(b0, sm.mm.sx[buf][2 * wn + 0], lane);
+        mm_load_ab_swz<layout>(b1, sm.mm.sx[buf][2 * wn + 1], lane);
 #pragma unroll
         for (int tm = 0; tm < 4; ++tm) {
             ggml_cuda_mma::tile<16, 8, half2, layout> a;
             mm_load_ab_swz<layout>(a, sm.mm.sw[buf][m0 + tm], lane);
-            ggml_cuda_mma::mma(d[tm][0], a, b0_hi);
-            ggml_cuda_mma::mma(d[tm][1], a, b1_hi);
-            ggml_cuda_mma::mma(d[tm][0], a, b0_lo);
-            ggml_cuda_mma::mma(d[tm][1], a, b1_lo);
+            ggml_cuda_mma::mma(d[tm][0], a, b0);
+            ggml_cuda_mma::mma(d[tm][1], a, b1);
         }
     };
 
-    float acc[4][2][8] = {};
+    ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d[4][2];
+#pragma unroll
+    for (int tm = 0; tm < 4; ++tm) {
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            d[tm][0].x[l] = 0.0f;
+            d[tm][1].x[l] = 0.0f;
+        }
+    }
     uint32_t c_reg[CPL];
-    int4 hi_v, lo_v;
+    int4 x_v;
 
     if (kt > 0) {
-        g_load(0, c_reg, hi_v, lo_v);
-        stage(0, c_reg, hi_v, lo_v);
+        g_load(0, c_reg, x_v);
+        stage(0, c_reg, x_v);
         __syncthreads();
     }
 
     const int kt2 = kt & ~1;
     for (int kb0 = 0; kb0 < kt2; kb0 += 2) {
-        ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d[4][2];
-#pragma unroll
-        for (int tm = 0; tm < 4; ++tm) {
-#pragma unroll
-            for (int l = 0; l < 8; ++l) {
-                d[tm][0].x[l] = 0.0f;
-                d[tm][1].x[l] = 0.0f;
-            }
-        }
-        g_load(kb0 + 1, c_reg, hi_v, lo_v);
+        g_load(kb0 + 1, c_reg, x_v);
         mma_step(0, d);
-        stage(1, c_reg, hi_v, lo_v);
+        stage(1, c_reg, x_v);
         __syncthreads();
 
         if (kb0 + 2 < kt) {
-            g_load(kb0 + 2, c_reg, hi_v, lo_v);
+            g_load(kb0 + 2, c_reg, x_v);
         }
         mma_step(1, d);
-#pragma unroll
-        for (int tm = 0; tm < 4; ++tm) {
-#pragma unroll
-            for (int l = 0; l < 8; ++l) {
-                acc[tm][0][l] += d[tm][0].x[l];
-                acc[tm][1][l] += d[tm][1].x[l];
-            }
-        }
         if (kb0 + 2 < kt) {
-            stage(0, c_reg, hi_v, lo_v);
+            stage(0, c_reg, x_v);
             __syncthreads();
         }
     }
     if (kt & 1) {
-        ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d[4][2];
-#pragma unroll
-        for (int tm = 0; tm < 4; ++tm) {
-#pragma unroll
-            for (int l = 0; l < 8; ++l) {
-                d[tm][0].x[l] = 0.0f;
-                d[tm][1].x[l] = 0.0f;
-            }
-        }
         mma_step(0, d);
-#pragma unroll
-        for (int tm = 0; tm < 4; ++tm) {
-#pragma unroll
-            for (int l = 0; l < 8; ++l) {
-                acc[tm][0][l] += d[tm][0].x[l];
-                acc[tm][1][l] += d[tm][1].x[l];
-            }
-        }
     }
     __syncthreads();
+
+    float acc[4][2][8];
+#pragma unroll
+    for (int tm = 0; tm < 4; ++tm) {
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            acc[tm][0][l] = d[tm][0].x[l];
+            acc[tm][1][l] = d[tm][1].x[l];
+        }
+    }
 
     mm_128x128_epilogue(acc, sm.ep, y, post, fuse_mode, N, batch, tile_base, col0, wave, lane, wm, wn);
 }
 
-// Double-buffered 128 rows x 256 tokens workgroup (2x8 wave grid, 16 waves = 512 threads).
-// Halves weight decode per token by splitting each 16x16 tile decode across two waves (4 weights/lane).
+// Double-buffered 128 rows x 256 tokens workgroup (2x4 wave grid, 8 waves = 256 threads, 2 WGs/CU).
+// Each wave computes 4x4 output tiles (64 rows x 64 tokens) in 25 KiB LDS with 4x A-fragment reuse.
 template <int BITS>
-static __global__ void __launch_bounds__(512, 1) k_product_mm_128x256(
-        const uint32_t * __restrict__ codes, const half2 * __restrict__ x_hilo,
+static __global__ void __launch_bounds__(256, 2) k_product_mm_128x256(
+        const uint32_t * __restrict__ codes, const half2 * __restrict__ x_f16,
         float * __restrict__ y, const float * __restrict__ post, int fuse_mode,
         int K, int N, int batch) {
     constexpr int NW = 8 * BITS;
@@ -1866,23 +1828,21 @@ static __global__ void __launch_bounds__(512, 1) k_product_mm_128x256(
     union shared_mem_t {
         struct {
             __align__(16) half2 sw[2][8][16 * 8];
-            __align__(16) half2 sx[2][16][2][16 * 8];
-            uint32_t sm_c[16][NW];
+            __align__(16) half2 sx[2][16][16 * 8];
+            uint32_t sm_c[8][NW];
         } mm;
-        float ep[64][129];
+        float ep[32][129];
     };
     __shared__ shared_mem_t sm;
 
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
-    const int wm   = wave >> 3, wn = wave & 7;
+    const int wm   = wave >> 2, wn = wave & 3;
     const int tile_base = 8 * blockIdx.x;
     const int col0 = 256 * blockIdx.y;
     const int kt   = K >> 4;
 
-    const int dec_m  = wave & 7;
-    const int dec_hi = wave >> 3;
-    const int decode_tile = tile_base + dec_m;
+    const int decode_tile = tile_base + wave;
     const bool decode_live = 16 * decode_tile < N;
     const uint32_t * decode_tiles = codes + (int64_t) decode_tile * kt * NW;
 
@@ -1892,15 +1852,17 @@ static __global__ void __launch_bounds__(512, 1) k_product_mm_128x256(
     const int swz_r = ((r >> 2) & 1) << 2;
     const anchor_plan<BITS> plan = anchor_plan<BITS>::make(lane);
 
-    const int tok = threadIdx.x >> 1;
+    const int tok0 = threadIdx.x >> 1;
     const int half_k = (threadIdx.x & 1) * 4;
-    const int sub_s = tok >> 4;
-    const int tr_s  = tok & 15;
+    const int sub_s0 = tok0 >> 4;
+    const int tr_s   = tok0 & 15;
     const int j0_swz = half_k ^ (((tr_s >> 2) & 1) << 2);
-    const int col_s = col0 + tok;
-    const bool tok_live = col_s < batch;
+    const int col_s0 = col0 + tok0;
+    const int col_s1 = col_s0 + 128;
+    const bool live0 = col_s0 < batch;
+    const bool live1 = col_s1 < batch;
 
-    auto g_load = [&](int kb, uint32_t (&c_reg)[CPL], int4 & hi_v, int4 & lo_v) {
+    auto g_load = [&](int kb, uint32_t (&c_reg)[CPL], int4 & x0, int4 & x1) {
         if (decode_live) {
             const uint32_t * tp = decode_tiles + (int64_t) kb * NW;
 #pragma unroll
@@ -1909,17 +1871,11 @@ static __global__ void __launch_bounds__(512, 1) k_product_mm_128x256(
                 if (idx < NW) { c_reg[u] = tp[idx]; }
             }
         }
-        if (tok_live) {
-            const half2 * src = x_hilo + ((int64_t) col_s * kt + kb) * 16;
-            hi_v = *reinterpret_cast<const int4 *>(src + half_k);
-            lo_v = *reinterpret_cast<const int4 *>(src + 8 + half_k);
-        } else {
-            hi_v = make_int4(0, 0, 0, 0);
-            lo_v = make_int4(0, 0, 0, 0);
-        }
+        x0 = live0 ? *reinterpret_cast<const int4 *>(x_f16 + ((int64_t) col_s0 * kt + kb) * 8 + half_k) : make_int4(0, 0, 0, 0);
+        x1 = live1 ? *reinterpret_cast<const int4 *>(x_f16 + ((int64_t) col_s1 * kt + kb) * 8 + half_k) : make_int4(0, 0, 0, 0);
     };
 
-    auto stage = [&](int buf, const uint32_t (&c_reg)[CPL], const int4 & hi_v, const int4 & lo_v) {
+    auto stage = [&](int buf, const uint32_t (&c_reg)[CPL], const int4 & x0, const int4 & x1) {
         if (decode_live) {
 #pragma unroll
             for (int u = 0; u < CPL; ++u) {
@@ -1927,134 +1883,104 @@ static __global__ void __launch_bounds__(512, 1) k_product_mm_128x256(
                 if (idx < NW) { sm.mm.sm_c[wave][idx] = c_reg[u]; }
             }
             asm volatile("" ::: "memory");
-            const uint32_t * st = sm.mm.sm_c[wave];
-            uint32_t rb[anchor_plan<BITS>::ANCH];
-#pragma unroll
-            for (int x = 0; x < anchor_plan<BITS>::ANCH; ++x) {
-                rb[x] = __builtin_amdgcn_alignbit(st[plan.w0[x]], st[plan.w1[x]], plan.sh[x]);
-            }
-            half2 * w2 = sm.mm.sw[buf][dec_m];
-            if (dec_hi == 0) {
-                w2[r * 8 + (c2 ^ swz_r)]       = __floats2half2_rn(grid_value4(anchored_state<BITS, 0>(rb)), grid_value4(anchored_state<BITS, 1>(rb)));
-                w2[r * 8 + ((c2 + 4) ^ swz_r)] = __floats2half2_rn(grid_value4(anchored_state<BITS, 2>(rb)), grid_value4(anchored_state<BITS, 3>(rb)));
-            } else {
-                w2[(r + 8) * 8 + (c2 ^ swz_r)]       = __floats2half2_rn(grid_value4(anchored_state<BITS, 4>(rb)), grid_value4(anchored_state<BITS, 5>(rb)));
-                w2[(r + 8) * 8 + ((c2 + 4) ^ swz_r)] = __floats2half2_rn(grid_value4(anchored_state<BITS, 6>(rb)), grid_value4(anchored_state<BITS, 7>(rb)));
-            }
+            float v[8];
+            decode8_plan<BITS>(sm.mm.sm_c[wave], plan, v);
+            half2 * w2 = sm.mm.sw[buf][wave];
+            w2[r * 8 + (c2 ^ swz_r)]             = __floats2half2_rn(v[0], v[1]);
+            w2[r * 8 + ((c2 + 4) ^ swz_r)]       = __floats2half2_rn(v[2], v[3]);
+            w2[(r + 8) * 8 + (c2 ^ swz_r)]       = __floats2half2_rn(v[4], v[5]);
+            w2[(r + 8) * 8 + ((c2 + 4) ^ swz_r)] = __floats2half2_rn(v[6], v[7]);
         }
-        *reinterpret_cast<int4 *>(sm.mm.sx[buf][sub_s][0] + tr_s * 8 + j0_swz) = hi_v;
-        *reinterpret_cast<int4 *>(sm.mm.sx[buf][sub_s][1] + tr_s * 8 + j0_swz) = lo_v;
+        *reinterpret_cast<int4 *>(sm.mm.sx[buf][sub_s0]     + tr_s * 8 + j0_swz) = x0;
+        *reinterpret_cast<int4 *>(sm.mm.sx[buf][sub_s0 + 8] + tr_s * 8 + j0_swz) = x1;
     };
 
-    auto mma_step = [&](int buf, ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> (&d)[4][2]) {
-        ggml_cuda_mma::tile<16, 8, half2, layout> b0_hi, b0_lo, b1_hi, b1_lo;
-        mm_load_ab_swz<layout>(b0_hi, sm.mm.sx[buf][2 * wn + 0][0], lane);
-        mm_load_ab_swz<layout>(b0_lo, sm.mm.sx[buf][2 * wn + 0][1], lane);
-        mm_load_ab_swz<layout>(b1_hi, sm.mm.sx[buf][2 * wn + 1][0], lane);
-        mm_load_ab_swz<layout>(b1_lo, sm.mm.sx[buf][2 * wn + 1][1], lane);
+    auto mma_step = [&](int buf, ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> (&d)[4][4]) {
+        ggml_cuda_mma::tile<16, 8, half2, layout> b0, b1, b2, b3;
+        mm_load_ab_swz<layout>(b0, sm.mm.sx[buf][4 * wn + 0], lane);
+        mm_load_ab_swz<layout>(b1, sm.mm.sx[buf][4 * wn + 1], lane);
+        mm_load_ab_swz<layout>(b2, sm.mm.sx[buf][4 * wn + 2], lane);
+        mm_load_ab_swz<layout>(b3, sm.mm.sx[buf][4 * wn + 3], lane);
 #pragma unroll
         for (int tm = 0; tm < 4; ++tm) {
             ggml_cuda_mma::tile<16, 8, half2, layout> a;
             mm_load_ab_swz<layout>(a, sm.mm.sw[buf][m0 + tm], lane);
-            ggml_cuda_mma::mma(d[tm][0], a, b0_hi);
-            ggml_cuda_mma::mma(d[tm][1], a, b1_hi);
-            ggml_cuda_mma::mma(d[tm][0], a, b0_lo);
-            ggml_cuda_mma::mma(d[tm][1], a, b1_lo);
+            ggml_cuda_mma::mma(d[tm][0], a, b0);
+            ggml_cuda_mma::mma(d[tm][1], a, b1);
+            ggml_cuda_mma::mma(d[tm][2], a, b2);
+            ggml_cuda_mma::mma(d[tm][3], a, b3);
         }
     };
 
-    float acc[4][2][8] = {};
+    ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d[4][4];
+#pragma unroll
+    for (int tm = 0; tm < 4; ++tm) {
+#pragma unroll
+        for (int tn = 0; tn < 4; ++tn) {
+#pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                d[tm][tn].x[l] = 0.0f;
+            }
+        }
+    }
     uint32_t c_reg[CPL];
-    int4 hi_v, lo_v;
+    int4 x0, x1;
 
     if (kt > 0) {
-        g_load(0, c_reg, hi_v, lo_v);
-        stage(0, c_reg, hi_v, lo_v);
+        g_load(0, c_reg, x0, x1);
+        stage(0, c_reg, x0, x1);
         __syncthreads();
     }
 
     const int kt2 = kt & ~1;
     for (int kb0 = 0; kb0 < kt2; kb0 += 2) {
-        ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d[4][2];
-#pragma unroll
-        for (int tm = 0; tm < 4; ++tm) {
-#pragma unroll
-            for (int l = 0; l < 8; ++l) {
-                d[tm][0].x[l] = 0.0f;
-                d[tm][1].x[l] = 0.0f;
-            }
-        }
-        g_load(kb0 + 1, c_reg, hi_v, lo_v);
+        g_load(kb0 + 1, c_reg, x0, x1);
         mma_step(0, d);
-        stage(1, c_reg, hi_v, lo_v);
+        stage(1, c_reg, x0, x1);
         __syncthreads();
 
         if (kb0 + 2 < kt) {
-            g_load(kb0 + 2, c_reg, hi_v, lo_v);
+            g_load(kb0 + 2, c_reg, x0, x1);
         }
         mma_step(1, d);
-#pragma unroll
-        for (int tm = 0; tm < 4; ++tm) {
-#pragma unroll
-            for (int l = 0; l < 8; ++l) {
-                acc[tm][0][l] += d[tm][0].x[l];
-                acc[tm][1][l] += d[tm][1].x[l];
-            }
-        }
         if (kb0 + 2 < kt) {
-            stage(0, c_reg, hi_v, lo_v);
+            stage(0, c_reg, x0, x1);
             __syncthreads();
         }
     }
     if (kt & 1) {
-        ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d[4][2];
-#pragma unroll
-        for (int tm = 0; tm < 4; ++tm) {
-#pragma unroll
-            for (int l = 0; l < 8; ++l) {
-                d[tm][0].x[l] = 0.0f;
-                d[tm][1].x[l] = 0.0f;
-            }
-        }
         mma_step(0, d);
-#pragma unroll
-        for (int tm = 0; tm < 4; ++tm) {
-#pragma unroll
-            for (int l = 0; l < 8; ++l) {
-                acc[tm][0][l] += d[tm][0].x[l];
-                acc[tm][1][l] += d[tm][1].x[l];
-            }
-        }
     }
     __syncthreads();
 
     const int row_base = 16 * tile_base;
+    // 8 passes of 32 tokens (2 N-waves x 16 tokens per pass)
 #pragma unroll
-    for (int pass = 0; pass < 4; ++pass) {
-        const int target_tn = pass & 1;
-        const int wn_base   = (pass >> 1) * 4;
-        if (wn >= wn_base && wn < wn_base + 4) {
-            const int tok64 = (wn - wn_base) * 16 + (lane & 15);
+    for (int pass = 0; pass < 8; ++pass) {
+        const int target_tn = pass & 3;
+        const int wn_base   = (pass >> 2) * 2;
+        if (wn == wn_base || wn == wn_base + 1) {
+            const int tok32 = (wn - wn_base) * 16 + (lane & 15);
 #pragma unroll
             for (int tm = 0; tm < 4; ++tm) {
                 const int r_off = (m0 + tm) * 16;
 #pragma unroll
                 for (int l = 0; l < 8; ++l) {
-                    sm.ep[tok64][r_off + wmma_c_row(lane, l)] = acc[tm][target_tn][l] * 0.25f;
+                    sm.ep[tok32][r_off + wmma_c_row(lane, l)] = d[tm][target_tn].x[l] * 0.25f;
                 }
             }
         }
         __syncthreads();
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
-            const int tok64 = wave * 4 + t;
-            const int wn_t  = wn_base + (tok64 >> 4);
-            const int ccol  = col0 + (2 * wn_t + target_tn) * 16 + (tok64 & 15);
+            const int tok32 = wave * 4 + t;
+            const int wn_t  = wn_base + (tok32 >> 4);
+            const int ccol  = col0 + (4 * wn_t + target_tn) * 16 + (tok32 & 15);
             if (ccol < batch) {
                 float v[4];
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    v[e] = sm.ep[tok64][lane + 32 * e];
+                    v[e] = sm.ep[tok32][lane + 32 * e];
                 }
                 if (fuse_mode == 2) {
                     hadamard_128_warp(v, lane);
@@ -2076,30 +2002,37 @@ static __global__ void __launch_bounds__(512, 1) k_product_mm_128x256(
                 }
             }
         }
-        if (pass < 3) {
+        if (pass < 7) {
             __syncthreads();
         }
     }
 }
 
-// Pipelined 1-wave 16 rows x 16 tokens workgroup (32 threads, 0 barriers) using precomputed (hi, lo) activations.
+// Pipelined 1-wave 16 rows x 16 tokens workgroup (32 threads, 0 barriers) with Split-K for tiny N (< 128).
 template <int BITS>
-static __global__ void __launch_bounds__(32, 16) k_product_mm_16x16_hilo(
-        const uint32_t * __restrict__ codes, const half2 * __restrict__ x_hilo,
-        float * __restrict__ y, int K, int N, int batch) {
+static __global__ void __launch_bounds__(32) k_product_mm_16x16_hilo(
+        const uint32_t * __restrict__ codes, const half2 * __restrict__ x_f16,
+        float * __restrict__ y, int K, int N, int batch, int splits) {
     constexpr int NW = 8 * BITS;
     constexpr int CPL = (NW + 31) / 32;
     constexpr ggml_cuda_mma::data_layout layout = ggml_cuda_mma::get_input_data_layout();
 
     __shared__ __align__(16) half2 sw[2][16 * 8];
-    __shared__ __align__(16) half2 sx[2][2][16 * 8];
+    __shared__ __align__(16) half2 sx[2][16 * 8];
     __shared__ uint32_t sm_c[NW];
 
     const int lane = threadIdx.x;
     const int tile = blockIdx.x;
     const int row0 = 16 * tile;
     const int col0 = 16 * blockIdx.y;
+    const int split = blockIdx.z;
     const int kt   = K >> 4;
+    const int kt_per_split = (kt + splits - 1) / splits;
+    const int kb_start = split * kt_per_split;
+    const int kb_end   = min(kb_start + kt_per_split, kt);
+    if (kb_start >= kb_end) {
+        return;
+    }
 
     const int c2 = lane & 3;
     const int r  = lane >> 2;
@@ -2114,7 +2047,7 @@ static __global__ void __launch_bounds__(32, 16) k_product_mm_16x16_hilo(
 
     const uint32_t * tiles = codes + (int64_t) tile * kt * NW;
 
-    auto g_load = [&](int kb, uint32_t (&c_reg)[CPL], int4 & hi_v, int4 & lo_v) {
+    auto g_load = [&](int kb, uint32_t (&c_reg)[CPL], int4 & x_v) {
         const uint32_t * tp = tiles + (int64_t) kb * NW;
 #pragma unroll
         for (int u = 0; u < CPL; ++u) {
@@ -2122,16 +2055,14 @@ static __global__ void __launch_bounds__(32, 16) k_product_mm_16x16_hilo(
             if (idx < NW) { c_reg[u] = tp[idx]; }
         }
         if (tok_live) {
-            const half2 * src = x_hilo + ((int64_t) col * kt + kb) * 16;
-            hi_v = *reinterpret_cast<const int4 *>(src + half_k);
-            lo_v = *reinterpret_cast<const int4 *>(src + 8 + half_k);
+            const half2 * src = x_f16 + ((int64_t) col * kt + kb) * 8;
+            x_v = *reinterpret_cast<const int4 *>(src + half_k);
         } else {
-            hi_v = make_int4(0, 0, 0, 0);
-            lo_v = make_int4(0, 0, 0, 0);
+            x_v = make_int4(0, 0, 0, 0);
         }
     };
 
-    auto stage = [&](int buf, const uint32_t (&c_reg)[CPL], const int4 & hi_v, const int4 & lo_v) {
+    auto stage = [&](int buf, const uint32_t (&c_reg)[CPL], const int4 & x_v) {
 #pragma unroll
         for (int u = 0; u < CPL; ++u) {
             const int idx = u * 32 + lane;
@@ -2145,193 +2076,246 @@ static __global__ void __launch_bounds__(32, 16) k_product_mm_16x16_hilo(
         w2[r * 8 + ((c2 + 4) ^ swz_r)]       = __floats2half2_rn(v[2], v[3]);
         w2[(r + 8) * 8 + (c2 ^ swz_r)]       = __floats2half2_rn(v[4], v[5]);
         w2[(r + 8) * 8 + ((c2 + 4) ^ swz_r)] = __floats2half2_rn(v[6], v[7]);
-        *reinterpret_cast<int4 *>(sx[buf][0] + tok * 8 + j0_swz) = hi_v;
-        *reinterpret_cast<int4 *>(sx[buf][1] + tok * 8 + j0_swz) = lo_v;
+        *reinterpret_cast<int4 *>(sx[buf] + tok * 8 + j0_swz) = x_v;
         asm volatile("" ::: "memory");
     };
 
-    float acc[8] = {};
+    ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) { d.x[l] = 0.0f; }
     uint32_t c_reg[CPL];
-    int4 hi_v, lo_v;
+    int4 x_v;
 
-    if (kt > 0) {
-        g_load(0, c_reg, hi_v, lo_v);
-        stage(0, c_reg, hi_v, lo_v);
-    }
+    g_load(kb_start, c_reg, x_v);
+    stage(0, c_reg, x_v);
 
-    const int kt2 = kt & ~1;
-    for (int kb0 = 0; kb0 < kt2; kb0 += 2) {
-        ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d;
-#pragma unroll
-        for (int l = 0; l < 8; ++l) { d.x[l] = 0.0f; }
-
-        g_load(kb0 + 1, c_reg, hi_v, lo_v);
+    const int n_kb = kb_end - kb_start;
+    const int n_kb2 = n_kb & ~1;
+    for (int off = 0; off < n_kb2; off += 2) {
+        const int kb = kb_start + off;
+        g_load(kb + 1, c_reg, x_v);
         {
-            ggml_cuda_mma::tile<16, 8, half2, layout> a, b_hi, b_lo;
+            ggml_cuda_mma::tile<16, 8, half2, layout> a, b;
             mm_load_ab_swz<layout>(a, sw[0], lane);
-            mm_load_ab_swz<layout>(b_hi, sx[0][0], lane);
-            mm_load_ab_swz<layout>(b_lo, sx[0][1], lane);
-            ggml_cuda_mma::mma(d, a, b_hi);
-            ggml_cuda_mma::mma(d, a, b_lo);
+            mm_load_ab_swz<layout>(b, sx[0], lane);
+            ggml_cuda_mma::mma(d, a, b);
         }
-        stage(1, c_reg, hi_v, lo_v);
+        stage(1, c_reg, x_v);
 
-        if (kb0 + 2 < kt) { g_load(kb0 + 2, c_reg, hi_v, lo_v); }
+        if (kb + 2 < kb_end) { g_load(kb + 2, c_reg, x_v); }
         {
-            ggml_cuda_mma::tile<16, 8, half2, layout> a, b_hi, b_lo;
+            ggml_cuda_mma::tile<16, 8, half2, layout> a, b;
             mm_load_ab_swz<layout>(a, sw[1], lane);
-            mm_load_ab_swz<layout>(b_hi, sx[1][0], lane);
-            mm_load_ab_swz<layout>(b_lo, sx[1][1], lane);
-            ggml_cuda_mma::mma(d, a, b_hi);
-            ggml_cuda_mma::mma(d, a, b_lo);
+            mm_load_ab_swz<layout>(b, sx[1], lane);
+            ggml_cuda_mma::mma(d, a, b);
         }
-#pragma unroll
-        for (int l = 0; l < 8; ++l) { acc[l] += d.x[l]; }
-        if (kb0 + 2 < kt) { stage(0, c_reg, hi_v, lo_v); }
+        if (kb + 2 < kb_end) { stage(0, c_reg, x_v); }
     }
-    if (kt & 1) {
-        ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d;
-#pragma unroll
-        for (int l = 0; l < 8; ++l) { d.x[l] = 0.0f; }
-        ggml_cuda_mma::tile<16, 8, half2, layout> a, b_hi, b_lo;
+    if (n_kb & 1) {
+        ggml_cuda_mma::tile<16, 8, half2, layout> a, b;
         mm_load_ab_swz<layout>(a, sw[0], lane);
-        mm_load_ab_swz<layout>(b_hi, sx[0][0], lane);
-        mm_load_ab_swz<layout>(b_lo, sx[0][1], lane);
-        ggml_cuda_mma::mma(d, a, b_hi);
-        ggml_cuda_mma::mma(d, a, b_lo);
-#pragma unroll
-        for (int l = 0; l < 8; ++l) { acc[l] += d.x[l]; }
+        mm_load_ab_swz<layout>(b, sx[0], lane);
+        ggml_cuda_mma::mma(d, a, b);
     }
 
     const int ccol = col0 + (lane & 15);
     if (ccol < batch) {
 #pragma unroll
         for (int l = 0; l < 8; ++l) {
-            y[(int64_t) ccol * N + row0 + wmma_c_row(lane, l)] = acc[l] * 0.25f;
+            const float val = d.x[l] * 0.25f;
+            float * dst = &y[(int64_t) ccol * N + row0 + wmma_c_row(lane, l)];
+            if (splits > 1) {
+                atomicAdd(dst, val);
+            } else {
+                *dst = val;
+            }
         }
     }
 }
 
-// 64 rows x 128 tokens workgroup (4x2 wave grid, 8 waves = 256 threads) for small N (< 128).
-template <int BITS, int KG>
-static __global__ void __launch_bounds__(256, 2) k_product_mm_64x128(
-        const uint32_t * __restrict__ codes, const half * __restrict__ s16,
-        const float * __restrict__ x, float * __restrict__ y, int K, int N, int batch) {
+// Double-buffered 64 rows x 128 tokens workgroup (2x4 wave grid, 8 waves = 256 threads, 2 k-tiles/step).
+// Used when 128x128 would launch fewer than 64 WGs (e.g. N=1024 attn_k/attn_v).
+template <int BITS>
+static __global__ void __launch_bounds__(256, 4) k_product_mm_64x128(
+        const uint32_t * __restrict__ codes, const half2 * __restrict__ x_f16,
+        float * __restrict__ y, const float * __restrict__ post, int fuse_mode,
+        int K, int N, int batch) {
     constexpr int NW = 8 * BITS;
+    constexpr int CPL = (NW + 31) / 32;
     constexpr ggml_cuda_mma::data_layout layout = ggml_cuda_mma::get_input_data_layout();
 
-    __shared__ __align__(16) half2 sw[4][KG][16 * 8];
-    __shared__ __align__(16) half2 sx[KG][8][2][16 * 8];
+    union shared_mem_t {
+        struct {
+            __align__(16) half2 sw[2][2][4][16 * 8];
+            __align__(16) half2 sx[2][2][8][16 * 8];
+            uint32_t sm_c[8][NW];
+        } mm;
+        float ep[32][65];
+    };
+    __shared__ shared_mem_t sm;
 
-    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int wm   = wave / 2, wn = wave % 2;
-    const int tile = 4 * blockIdx.x + wm;
-    const int row0 = 16 * tile;
+    const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    const int wm   = wave >> 2, wn = wave & 3;
+    const int tile_base = 4 * blockIdx.x;
     const int col0 = 128 * blockIdx.y;
-    const int kt   = K / 16;
-    const bool live = row0 < N;
+    const int kt   = K >> 4;
 
-    const int c2 = lane % 4;
-    const int r  = lane / 4;
+    const int decode_sub_k = wave >> 2; // 0 or 1
+    const int decode_m     = wave & 3;  // 0..3
+    const int decode_tile  = tile_base + decode_m;
+    const bool decode_live = 16 * decode_tile < N;
+    const uint32_t * decode_tiles = codes + (int64_t) decode_tile * kt * NW;
+
+    const int m0 = 2 * wm;
+    const int c2 = lane & 3;
+    const int r  = lane >> 2;
     const int swz_r = ((r >> 2) & 1) << 2;
     const anchor_plan<BITS> plan = anchor_plan<BITS>::make(lane);
 
-    const int t0  = threadIdx.x / 4;        // 0..63
-    const int kp  = (threadIdx.x % 4) * 4;  // 0, 4, 8, 12 (float index)
-    const int kp2 = (threadIdx.x % 4) * 2;  // 0, 2, 4, 6 (half2 index)
+    const int tok = threadIdx.x >> 1;
+    const int half_k = (threadIdx.x & 1) * 4;
+    const int sub_s = tok >> 4;
+    const int tr_s  = tok & 15;
+    const int j0_swz = half_k ^ (((tr_s >> 2) & 1) << 2);
+    const int col_s = col0 + tok;
+    const bool tok_live = col_s < batch;
 
-    float acc[4][8] = {};
-
-    const uint32_t * tiles = codes + (int64_t) tile * kt * NW;
-    for (int kb0 = 0; kb0 < kt; kb0 += KG) {
-        const int jn = min(KG, kt - kb0);
-        if (live) {
+    auto g_load = [&](int kb0, uint32_t (&c_reg)[CPL], int4 & x0, int4 & x1) {
+        const int kb_w = kb0 + decode_sub_k;
+        if (decode_live && kb_w < kt) {
+            const uint32_t * tp = decode_tiles + (int64_t) kb_w * NW;
 #pragma unroll
-            for (int j = wn; j < KG; j += 2) {
-                if (j >= jn) { break; }
-                half2 * w2 = sw[wm][j];
-                float v[8];
-                decode8_plan<BITS>(tiles + (int64_t) (kb0 + j) * NW, plan, v);
-                w2[r * 8 + (c2 ^ swz_r)]             = __floats2half2_rn(v[0], v[1]);
-                w2[r * 8 + ((c2 + 4) ^ swz_r)]       = __floats2half2_rn(v[2], v[3]);
-                w2[(r + 8) * 8 + (c2 ^ swz_r)]       = __floats2half2_rn(v[4], v[5]);
-                w2[(r + 8) * 8 + ((c2 + 4) ^ swz_r)] = __floats2half2_rn(v[6], v[7]);
+            for (int u = 0; u < CPL; ++u) {
+                const int idx = u * 32 + lane;
+                if (idx < NW) { c_reg[u] = tp[idx]; }
             }
         }
-#pragma unroll
-        for (int j = 0; j < KG; ++j) {
-            if (j >= jn) { break; }
-            const float s = __half2float(s16[kb0 + j]);
-#pragma unroll
-            for (int p = 0; p < 2; ++p) {
-                const int tok = p * 64 + t0;
-                const int sub = tok >> 4;
-                const int tr  = tok & 15;
-                const int kp2_swz = kp2 ^ (((tr >> 2) & 1) << 2);
-                const int col = col0 + tok;
-                const float4 fv = col < batch
-                    ? *reinterpret_cast<const float4 *>(x + (int64_t) col * K + 16 * (kb0 + j) + kp)
-                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                const float f0 = fv.x * s, f1 = fv.y * s, f2 = fv.z * s, f3 = fv.w * s;
-                const half2 hi01 = __floats2half2_rn(f0, f1);
-                const half2 hi23 = __floats2half2_rn(f2, f3);
-                const float2 hf01 = __half22float2(hi01);
-                const float2 hf23 = __half22float2(hi23);
-                half2 * hi = sx[j][sub][0];
-                half2 * lo = sx[j][sub][1];
-                hi[tr * 8 + kp2_swz + 0] = hi01;
-                hi[tr * 8 + kp2_swz + 1] = hi23;
-                lo[tr * 8 + kp2_swz + 0] = __floats2half2_rn(f0 - hf01.x, f1 - hf01.y);
-                lo[tr * 8 + kp2_swz + 1] = __floats2half2_rn(f2 - hf23.x, f3 - hf23.y);
-            }
+        if (tok_live) {
+            const half2 * base = x_f16 + ((int64_t) col_s * kt + kb0) * 8 + half_k;
+            x0 = *reinterpret_cast<const int4 *>(base);
+            x1 = (kb0 + 1 < kt) ? *reinterpret_cast<const int4 *>(base + 8) : make_int4(0, 0, 0, 0);
+        } else {
+            x0 = make_int4(0, 0, 0, 0);
+            x1 = make_int4(0, 0, 0, 0);
         }
-        __syncthreads();
+    };
 
-        if (live) {
-            ggml_cuda_mma::tile<16, 8, half2, layout> a[KG];
+    auto stage = [&](int buf, int kb0, const uint32_t (&c_reg)[CPL], const int4 & x0, const int4 & x1) {
+        if (decode_live && kb0 + decode_sub_k < kt) {
 #pragma unroll
-            for (int j = 0; j < KG; ++j) {
-                if (j >= jn) { break; }
-                mm_load_ab_swz<layout>(a[j], sw[wm][j], lane);
+            for (int u = 0; u < CPL; ++u) {
+                const int idx = u * 32 + lane;
+                if (idx < NW) { sm.mm.sm_c[wave][idx] = c_reg[u]; }
             }
+            asm volatile("" ::: "memory");
+            float v[8];
+            decode8_plan<BITS>(sm.mm.sm_c[wave], plan, v);
+            half2 * w2 = sm.mm.sw[buf][decode_sub_k][decode_m];
+            w2[r * 8 + (c2 ^ swz_r)]             = __floats2half2_rn(v[0], v[1]);
+            w2[r * 8 + ((c2 + 4) ^ swz_r)]       = __floats2half2_rn(v[2], v[3]);
+            w2[(r + 8) * 8 + (c2 ^ swz_r)]       = __floats2half2_rn(v[4], v[5]);
+            w2[(r + 8) * 8 + ((c2 + 4) ^ swz_r)] = __floats2half2_rn(v[6], v[7]);
+        }
+        *reinterpret_cast<int4 *>(sm.mm.sx[buf][0][sub_s] + tr_s * 8 + j0_swz) = x0;
+        *reinterpret_cast<int4 *>(sm.mm.sx[buf][1][sub_s] + tr_s * 8 + j0_swz) = x1;
+    };
+
+    auto mma_step = [&](int buf, int n_k, ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> (&d)[2][2]) {
 #pragma unroll
-            for (int tn = 0; tn < 4; ++tn) {
-                const int sub = 4 * wn + tn;
-                ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d;
+        for (int sk = 0; sk < 2; ++sk) {
+            if (sk >= n_k) { break; }
+            ggml_cuda_mma::tile<16, 8, half2, layout> b0, b1;
+            mm_load_ab_swz<layout>(b0, sm.mm.sx[buf][sk][2 * wn + 0], lane);
+            mm_load_ab_swz<layout>(b1, sm.mm.sx[buf][sk][2 * wn + 1], lane);
 #pragma unroll
-                for (int l = 0; l < d.ne; ++l) {
-                    d.x[l] = 0.0f;
-                }
-#pragma unroll
-                for (int j = 0; j < KG; ++j) {
-                    if (j >= jn) { break; }
-                    ggml_cuda_mma::tile<16, 8, half2, layout> b_hi, b_lo;
-                    mm_load_ab_swz<layout>(b_hi, sx[j][sub][0], lane);
-                    mm_load_ab_swz<layout>(b_lo, sx[j][sub][1], lane);
-                    ggml_cuda_mma::mma(d, a[j], b_hi);
-                    ggml_cuda_mma::mma(d, a[j], b_lo);
-                }
-#pragma unroll
-                for (int l = 0; l < d.ne; ++l) {
-                    acc[tn][l] += d.x[l];
-                }
+            for (int tm = 0; tm < 2; ++tm) {
+                ggml_cuda_mma::tile<16, 8, half2, layout> a;
+                mm_load_ab_swz<layout>(a, sm.mm.sw[buf][sk][m0 + tm], lane);
+                ggml_cuda_mma::mma(d[tm][0], a, b0);
+                ggml_cuda_mma::mma(d[tm][1], a, b1);
             }
         }
+    };
+
+    ggml_cuda_mma::tile<16, 16, float, ggml_cuda_mma::DATA_LAYOUT_I_MAJOR> d[2][2];
+#pragma unroll
+    for (int tm = 0; tm < 2; ++tm) {
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            d[tm][0].x[l] = 0.0f;
+            d[tm][1].x[l] = 0.0f;
+        }
+    }
+    uint32_t c_reg[CPL];
+    int4 x0, x1;
+
+    const int n_pairs = (kt + 1) >> 1;
+    if (n_pairs > 0) {
+        g_load(0, c_reg, x0, x1);
+        stage(0, 0, c_reg, x0, x1);
         __syncthreads();
     }
 
-    if (!live) {
-        return;
-    }
+    const int np2 = n_pairs & ~1;
+    for (int p = 0; p < np2; p += 2) {
+        const int kb0 = p * 2;
+        g_load(kb0 + 2, c_reg, x0, x1);
+        mma_step(0, min(2, kt - kb0), d);
+        stage(1, kb0 + 2, c_reg, x0, x1);
+        __syncthreads();
 
+        if (p + 2 < n_pairs) {
+            g_load(kb0 + 4, c_reg, x0, x1);
+        }
+        mma_step(1, min(2, kt - (kb0 + 2)), d);
+        if (p + 2 < n_pairs) {
+            stage(0, kb0 + 4, c_reg, x0, x1);
+            __syncthreads();
+        }
+    }
+    if (n_pairs & 1) {
+        const int kb0 = np2 * 2;
+        mma_step(0, min(2, kt - kb0), d);
+    }
+    __syncthreads();
+
+    const int row_base = 16 * tile_base;
 #pragma unroll
-    for (int tn = 0; tn < 4; ++tn) {
-        const int ccol = col0 + (4 * wn + tn) * 16 + (lane & 15);
-        if (ccol < batch) {
+    for (int pass = 0; pass < 4; ++pass) {
+        const int target_tn = pass & 1;
+        const int wn_base   = (pass >> 1) * 2;
+        if (wn == wn_base || wn == wn_base + 1) {
+            const int tok32 = (wn - wn_base) * 16 + (lane & 15);
 #pragma unroll
-            for (int l = 0; l < 8; ++l) {
-                y[(int64_t) ccol * N + row0 + wmma_c_row(lane, l)] = acc[tn][l] * 0.25f;
+            for (int tm = 0; tm < 2; ++tm) {
+                const int r_off = (m0 + tm) * 16;
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    sm.ep[tok32][r_off + wmma_c_row(lane, l)] = d[tm][target_tn].x[l] * 0.25f;
+                }
             }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int tok32 = wave * 4 + t;
+            const int wn_t  = wn_base + (tok32 >> 4);
+            const int ccol  = col0 + (2 * wn_t + target_tn) * 16 + (tok32 & 15);
+            if (ccol < batch) {
+                float * yrow = y + (int64_t) ccol * N + row_base;
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int i = lane + 32 * e;
+                    if (row_base + i < N) {
+                        const float v = sm.ep[tok32][i];
+                        yrow[i] = fuse_mode == 1 ? (v * post[row_base + i]) : v;
+                    }
+                }
+            }
+        }
+        if (pass < 3) {
+            __syncthreads();
         }
     }
 }
@@ -2719,12 +2703,18 @@ static inline int mv1_fuse_mode(const op_t & o) {
 
 static inline int choose_mv1_splits(int total_wgs, int K) {
     const int kt = K >> 4;
-    if (total_wgs >= 128 || kt < 32) {
+    if (total_wgs >= 256 || kt < 64) {
         return 1;
     }
-    int splits = (128 + total_wgs - 1) / total_wgs;
-    splits = std::min(splits, kt / 16);
-    splits = std::min(splits, 16);
+    const int max_splits = std::min(kt / 32, 16);
+    if (max_splits <= 1) {
+        return 1;
+    }
+    int splits = (256 + total_wgs - 1) / total_wgs;
+    if (splits < max_splits && ((total_wgs * (splits + 1)) % 64) == 0) {
+        splits += 1;
+    }
+    splits = std::min(splits, max_splits);
     return std::max(splits, 1);
 }
 
@@ -2766,7 +2756,7 @@ static inline bool hip_wmma_supported(int cc) {
 }
 
 static inline bool op_uses_hilo_mm(const op_t & o, int batch, bool wmma) {
-    return wmma && batch >= 32 && o.N % 16 == 0 && hip_mm_enabled();
+    return wmma && batch >= 64 && o.N % 16 == 0 && hip_mm_enabled();
 }
 
 template <int BITS>
@@ -2774,7 +2764,7 @@ static void launch_mm_hilo(ggml_cuda_pool & pool, const uint32_t * codes, const 
                            const float * in, float * out, const float * post, int fuse_mode,
                            int K, int N, int batch, bool prepped_hilo, cudaStream_t stream) {
     const int kt = K >> 4;
-    ggml_cuda_pool_alloc<float> act_buf(pool, prepped_hilo ? 0 : (size_t) batch * K);
+    ggml_cuda_pool_alloc<float> act_buf(pool, prepped_hilo ? 0 : (size_t) batch * K / 2);
     const half2 * x_hilo = prepped_hilo ? reinterpret_cast<const half2 *>(in)
                                         : reinterpret_cast<const half2 *>(act_buf.ptr);
     if (!prepped_hilo) {
@@ -2783,16 +2773,25 @@ static void launch_mm_hilo(ggml_cuda_pool & pool, const uint32_t * codes, const 
             in, s16, reinterpret_cast<half2 *>(act_buf.ptr), K, batch);
     }
     if (N < 128) {
-        const dim3 grid(N / 16, (batch + 15) / 16, 1);
-        k_product_mm_16x16_hilo<BITS><<<grid, 32, 0, stream>>>(codes, x_hilo, out, K, N, batch);
+        const int gy = (batch + 15) / 16;
+        const int base_wgs = (N / 16) * gy;
+        const int splits = (base_wgs < 256 && kt >= 64) ? std::min(4, std::max(1, (384 + base_wgs - 1) / base_wgs)) : 1;
+        if (splits > 1) {
+            CUDA_CHECK(cudaMemsetAsync(out, 0, (size_t) batch * N * sizeof(float), stream));
+        }
+        const dim3 grid(N / 16, gy, splits);
+        k_product_mm_16x16_hilo<BITS><<<grid, 32, 0, stream>>>(codes, x_hilo, out, K, N, batch, splits);
         return;
     }
     const int gx = (N / 16 + 7) / 8;
+    const int gy128 = (batch + 127) / 128;
     const int gy256 = (batch + 255) / 256;
-    if (batch >= 256 && gx * gy256 >= 192) {
-        k_product_mm_128x256<BITS><<<dim3(gx, gy256, 1), 512, 0, stream>>>(codes, x_hilo, out, post, fuse_mode, K, N, batch);
+    if (batch >= 256 && gx * gy256 >= 96) {
+        k_product_mm_128x256<BITS><<<dim3(gx, gy256, 1), 256, 0, stream>>>(codes, x_hilo, out, post, fuse_mode, K, N, batch);
+    } else if (fuse_mode != 2 && gx * gy128 < 64) {
+        k_product_mm_64x128<BITS><<<dim3((N / 16 + 3) / 4, gy128, 1), 256, 0, stream>>>(codes, x_hilo, out, post, fuse_mode, K, N, batch);
     } else {
-        k_product_mm_128x128<BITS, 2><<<dim3(gx, (batch + 127) / 128, 1), 256, 0, stream>>>(codes, x_hilo, out, post, fuse_mode, K, N, batch);
+        k_product_mm_128x128<BITS, 2><<<dim3(gx, gy128, 1), 256, 0, stream>>>(codes, x_hilo, out, post, fuse_mode, K, N, batch);
     }
 }
 
@@ -2806,7 +2805,7 @@ static void launch_mm_hilo(ggml_cuda_pool & pool, const uint32_t * codes, const 
             k_product_mv_v2<BITS, 1><<<dim3((N + 127) / 128, splits, 1), 256, 0, stream>>>(                \
                 codes, s16, in, out, dst, post, fuse_mode, counters, K, N, 1, splits);                     \
         } else if (wmma && batch >= 9 && N % 16 == 0 && hip_mm_enabled()) {                                \
-            if (batch >= 32) {                                                                             \
+            if (batch >= 64) {                                                                             \
                 launch_mm_hilo<BITS>(pool, codes, s16, in, out, post, fuse_mode, K, N, batch, prepped_hilo, stream); \
             } else {                                                                                       \
                 const dim3 grid((N / 16 + 7) / 8, (batch + 31) / 32, 1);                                   \
@@ -3014,7 +3013,7 @@ void ggml_cuda_op_trellis_group(ggml_backend_cuda_context & ctx, ggml_tensor * c
     const bool wmma = hip_wmma_supported(cc);
 
     // Deduplicate input buffers when (cols_kind, cols_block, cols_shards, pre, s16 if hilo) match
-    const bool group_hilo_possible = wmma && T >= 32 && hip_mm_enabled();
+    const bool group_hilo_possible = wmma && T >= 64 && hip_mm_enabled();
     int in_slot[TRELLIS_GROUP_MAX];
     int n_in_slots = 0;
     for (int i = 0; i < n; ++i) {
@@ -3147,7 +3146,7 @@ void ggml_cuda_op_trellis_group(ggml_backend_cuda_context & ctx, ggml_tensor * c
             }
         } else {
             for (int i = 0; i < n; ++i) {
-                const bool can_fuse_mm = wmma && batch >= 32 && ops[i].N >= 128 && ops[i].N % 16 == 0 && hip_mm_enabled();
+                const bool can_fuse_mm = wmma && batch >= 64 && ops[i].N >= 128 && ops[i].N % 16 == 0 && hip_mm_enabled();
                 const int fm = can_fuse_mm ? mv1_fuse_mode(ops[i]) : 0;
                 const bool ph = slot_hilo[in_slot[i]];
                 if (fm > 0) {
@@ -3267,7 +3266,7 @@ void ggml_cuda_op_trellis_mlp_chain(ggml_backend_cuda_context & ctx, ggml_tensor
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const bool wmma = hip_wmma_supported(cc);
 
-    const bool mlp_hilo_possible = wmma && og.T >= 32 && hip_mm_enabled();
+    const bool mlp_hilo_possible = wmma && og.T >= 64 && hip_mm_enabled();
     const bool same_in = og.cols_kind == ou.cols_kind && og.cols_block == ou.cols_block &&
                          og.cols_shards == ou.cols_shards && og.pin == ou.pin &&
                          og.pre->data == ou.pre->data &&
